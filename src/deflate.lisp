@@ -182,9 +182,26 @@ bits across all matches."
       (write-bits writer 0 (- 8 pad)))))
 
 (defun stored-block-bits (writer n)
-  "Bit count of a stored block of N bytes given WRITER's current alignment."
+  "Bit count of stored blocks covering N bytes given WRITER's current
+  alignment.  Blocks after the first start at a byte boundary."
   (let ((pad (mod (- 8 (+ (logand 7 (bw-nbits writer)) 3)) 8)))
-    (+ 3 pad 32 (* 8 n))))
+    (if (<= n +max-stored-block+)
+        (+ 3 pad 32 (* 8 n))
+        (+ (* 8 n)
+           (+ 3 pad 32)
+           (* (+ 3 32) (1- (ceiling n +max-stored-block+)))))))
+
+(defun emit-stored-blocks (writer input start end)
+  "Emit INPUT[START,END) as stored blocks, splitting at +MAX-STORED-BLOCK+
+  bytes per block."
+  (declare (optimize (speed 3) (safety 0))
+           (type simple-array input)
+           (type fixnum start end))
+  (if (< start end)
+      (loop for s from start below end by +max-stored-block+
+            do (let ((e (min end (+ s +max-stored-block+))))
+                 (emit-stored-block writer input s e (>= e end))))
+      (emit-stored-block writer input start end t)))
 
 (defun emit-stored-block (writer input start end bfinal)
   (declare (optimize (speed 3) (safety 0))
@@ -346,11 +363,7 @@ emits stored blocks; higher levels pick the cheapest block encoding."
            (type fixnum start end level))
   (let ((n (- end start)))
     (if (zerop level)
-        (if (< start end)
-            (loop for s from start below end by +max-stored-block+
-                  do (let ((e (min end (+ s +max-stored-block+))))
-                       (emit-stored-block writer input s e (>= e end))))
-            (emit-stored-block writer input start end t))
+        (emit-stored-blocks writer input start end)
         (let ((sym (make-array (1+ n) :element-type 'fixnum))
               (dist (make-array (1+ n) :element-type 'fixnum))
               (el (make-array (1+ n) :element-type 'fixnum))
@@ -408,7 +421,7 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                                     (stored-size (stored-block-bits writer n)))
                                 (cond
                                   ((<= stored-size (min opt-size fixed-size))
-                                   (emit-stored-block writer input start end t))
+                                   (emit-stored-blocks writer input start end))
                                   ((<= fixed-size opt-size)
                                    (emit-fixed-block writer sym dist el ed nsym t))
                                   (t

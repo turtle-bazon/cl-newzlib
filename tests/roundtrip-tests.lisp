@@ -69,6 +69,23 @@
                       (is (equalp data d)
                           (format nil "tiny n=~D level=~D" n level))))))
 
+(test stored-blocks-large-incompressible
+  ;; incompressible data larger than one stored block (65535 bytes) must
+  ;; roundtrip; the stored fallback has to split into multiple blocks
+  (loop for level in '(0 1 6 9)
+        do (let* ((data (incompressible-data 300000))
+                  (c (compress-octets data :format :raw :level level))
+                  (d (decompress-octets c :format :raw)))
+             (is (equalp data d)
+                 (format nil "stored fallback level ~D" level)))))
+
+(test stored-blocks-large-incompressible-zlib
+  ;; same, through the zlib wrapper so the Adler-32 trailer is checked
+  (let* ((data (incompressible-data 200000))
+         (c (compress-octets data :format :zlib :level 1))
+         (d (decompress-octets c :format :zlib)))
+    (is (equalp data d))))
+
 (test compress-level-0-is-stored
   (let* ((data (incompressible-data 5000))
          (c (compress-octets data :format :raw :level 0))

@@ -90,6 +90,12 @@
          (stream (cffi:foreign-alloc '(:struct z-stream))))
     (unwind-protect
          (progn
+           ;; zlib only installs its default allocator when ZALLOC/ZFREE are
+           ;; NULL, so the struct must be zeroed or garbage pointers get called.
+           (cffi:with-foreign-slots ((zalloc zfree opaque) stream (:struct z-stream))
+             (setf zalloc (cffi:null-pointer)
+                   zfree (cffi:null-pointer)
+                   opaque (cffi:null-pointer)))
            (cffi:with-foreign-slots ((next-in avail-in next-out avail-out)
                                      stream (:struct z-stream))
              (setf next-in src avail-in n next-out dst avail-out bound))
@@ -120,6 +126,10 @@
          (stream (cffi:foreign-alloc '(:struct z-stream))))
     (unwind-protect
          (progn
+           (cffi:with-foreign-slots ((zalloc zfree opaque) stream (:struct z-stream))
+             (setf zalloc (cffi:null-pointer)
+                   zfree (cffi:null-pointer)
+                   opaque (cffi:null-pointer)))
            (cffi:with-foreign-slots ((next-in avail-in next-out avail-out)
                                      stream (:struct z-stream))
              (setf next-in src avail-in n next-out dst avail-out cap))

@@ -4,6 +4,8 @@
 ;;;
 ;;; Reads a raw DEFLATE stream from a bit-reader, handling stored, fixed and
 ;;; dynamic blocks, and appends decoded output to a growable octet buffer.
+;;; Output is a plain (unsigned-byte 8) array with an explicit position;
+;;; matches are copied in chunks so long runs avoid per-byte pushes.
 
 ;;; ------------------------------------------------------------------
 ;;; Fixed Huffman trees
@@ -43,37 +45,85 @@
   nil)
 
 ;;; ------------------------------------------------------------------
+;;; Output buffer
+;;; ------------------------------------------------------------------
+
+(declaim (inline ensure-out-capacity))
+(defun ensure-out-capacity (buffer size pos need)
+  "Grow BUFFER so that at least NEED bytes fit starting at POS.  Returns
+(VALUES BUFFER NEW-SIZE)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum size pos need))
+  (if (<= (+ pos need) size)
+      (values buffer size)
+      (let ((new-size size))
+        (loop while (< new-size (+ pos need)) do (setf new-size (* 2 new-size)))
+        (let ((new (make-octet-buffer new-size)))
+          (replace new buffer :end2 size)
+          (values new new-size)))))
+
+;;; ------------------------------------------------------------------
 ;;; Stored blocks
 ;;; ------------------------------------------------------------------
 
-(defun inflate-stored-block (reader out)
-  (declare (optimize (speed 3) (safety 0)))
+(defun inflate-stored-block (reader buffer size pos)
+  "Decode one stored block into BUFFER[POS..].  Returns (VALUES BUFFER POS SIZE)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum size pos))
   (align-reader reader)
   (let ((len (read-bits reader 16))
         (nlen (read-bits reader 16)))
+    (declare (type fixnum len))
     (unless (= (logand (lognot len) #xFFFF) nlen)
       (error 'newzlib-format-error :detail "stored block length mismatch"))
-    (loop repeat len do
-      (vector-push-extend (read-bits reader 8) out)))
-  nil)
+    (multiple-value-bind (buffer size)
+        (ensure-out-capacity buffer size pos len)
+      ;; drain whole bytes still pending in the reader accumulator
+      (loop while (and (plusp len) (>= (br-nbits reader) 8)) do
+        (setf (aref buffer pos) (read-bits reader 8))
+        (incf pos)
+        (decf len))
+      ;; the rest is byte-aligned in the input buffer
+      (when (plusp len)
+        (let ((n (min len (- (br-end reader) (br-pos reader)))))
+          (replace buffer (br-buffer reader)
+                   :start1 pos :start2 (br-pos reader)
+                   :end1 (+ pos n) :end2 (+ (br-pos reader) n))
+          (setf (br-pos reader) (+ (br-pos reader) n)
+                pos (+ pos n)
+                len (- len n)))
+        (loop while (plusp len) do
+          (setf (aref buffer pos) (read-bits reader 8))
+          (incf pos)
+          (decf len)))
+      (values buffer pos size))))
 
 ;;; ------------------------------------------------------------------
 ;;; Token stream (fixed and dynamic blocks)
 ;;; ------------------------------------------------------------------
 
-(defun inflate-token-stream (reader out lit dist)
+(defun inflate-token-stream (reader buffer size pos lit dist)
   "Decode literal/length-distance tokens from READER using LIT and DIST
-  decode tables, appending output bytes to OUT until the end-of-block code."
+decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
   (declare (optimize (speed 3) (safety 0))
-           (type huffman-decode-table lit dist))
+           (type huffman-decode-table lit dist)
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum size pos))
   (loop do
     (let ((sym (huffman-decode lit reader)))
       (declare (type fixnum sym))
       (cond
         ((< sym 256)
-         (vector-push-extend sym out))
+         (multiple-value-bind (nbuffer nsize)
+             (ensure-out-capacity buffer size pos 1)
+           (setf buffer nbuffer
+                 size nsize)
+           (setf (aref buffer pos) sym)
+           (incf pos)))
         ((= sym 256)
-         (return))
+         (loop-finish))
         (t
          (when (> sym 285)
            (error 'newzlib-format-error :detail "invalid length code"))
@@ -86,15 +136,28 @@
            (let ((distance (+ (dist-base dcode)
                               (read-bits reader (dist-extra-bits dcode)))))
              (declare (type fixnum distance))
-             (when (> distance (length out))
+             (when (> distance pos)
                (error 'newzlib-format-error :detail "match distance exceeds output"))
-             (let ((src (- (length out) distance)))
+             (let ((src (- pos distance)))
                (declare (type fixnum src))
-               (loop repeat length do
-                 (vector-push-extend (aref out src) out)
-                 (incf src)))))))))
-  nil)
-
+               (multiple-value-bind (nbuffer nsize)
+                   (ensure-out-capacity buffer size pos length)
+                 (setf buffer nbuffer
+                       size nsize)
+                  (if (<= length distance)
+                      ;; non-overlapping copy
+                      (progn
+                        (replace buffer buffer
+                                 :start1 pos :start2 src
+                                 :end1 (+ pos length) :end2 (+ src length))
+                        (incf pos length))
+                      ;; overlapping copy: each byte reads the byte DISTANCE
+                      ;; back, which this same copy has already written
+                      (progn
+                        (loop for i from pos below (+ pos length) do
+                          (setf (aref buffer i) (aref buffer (- i distance))))
+                        (incf pos length)))))))))))
+    (values buffer pos size))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------
@@ -154,34 +217,53 @@
 ;;; Block driver
 ;;; ------------------------------------------------------------------
 
-(defun inflate-blocks (reader out)
-  "Decode consecutive DEFLATE blocks from READER until the final block."
-  (declare (optimize (speed 3) (safety 0)))
+(defun inflate-blocks (reader buffer size pos)
+  "Decode consecutive DEFLATE blocks from READER into BUFFER[POS..].  Returns
+(VALUES BUFFER POS SIZE)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum size pos))
   (loop do
     (let ((bfinal (read-bits reader 1))
           (btype (read-bits reader 2)))
       (declare (type fixnum bfinal btype))
       (case btype
-        (0 (inflate-stored-block reader out))
+        (0 (multiple-value-bind (nbuffer npos nsize)
+               (inflate-stored-block reader buffer size pos)
+             (setf buffer nbuffer
+                   pos npos
+                   size nsize)))
         (1 (multiple-value-bind (lit dist) (ensure-fixed-tables)
-             (inflate-token-stream reader out lit dist)))
+             (multiple-value-bind (nbuffer npos nsize)
+                 (inflate-token-stream reader buffer size pos lit dist)
+               (setf buffer nbuffer
+                     pos npos
+                     size nsize))))
         (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader)
-             (inflate-token-stream reader out lit dist)))
+             (multiple-value-bind (nbuffer npos nsize)
+                 (inflate-token-stream reader buffer size pos lit dist)
+               (setf buffer nbuffer
+                     pos npos
+                     size nsize))))
         (otherwise (error 'newzlib-format-error :detail "invalid block type")))
       (when (plusp bfinal)
-        (return))))
-  nil)
+        (loop-finish))))
+  (values buffer pos size))
 
 (defun inflate-raw (input &optional (start 0) (end (length input)))
   "Decompress a raw DEFLATE stream INPUT[START,END).  Returns a fresh
   octet vector."
-  (declare (type simple-array input)
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
   (let ((reader (make-bit-reader input start end))
-        (out (make-growable-buffer 1024)))
-    (inflate-blocks reader out)
-    (let ((result (make-octet-buffer (length out))))
-      (replace result out)
-      result)))
+        (size 1024)
+        (pos 0))
+    (declare (type fixnum size pos))
+    (let ((buffer (make-octet-buffer size)))
+      (multiple-value-bind (buffer pos)
+          (inflate-blocks reader buffer size pos)
+        (let ((result (make-octet-buffer pos)))
+          (replace result buffer :end2 pos)
+          result)))))

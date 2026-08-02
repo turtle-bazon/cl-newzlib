@@ -16,27 +16,62 @@
 (defconstant +max-dist+ 32768)
 (defconstant +max-stored-block+ 65535)
 
-;;; Compression-level tuning (approximates zlib's max_chain_length and
-;;; nice_length for each level; we do greedy matching, no lazy).
-(defun chain-limit (level)
+;;; Compression-level tuning, mirroring zlib's configuration_table
+;;; (good_length, max_lazy, nice_length, max_chain).  Lazy matching is only
+;;; used for levels >= 4 (deflate_slow); levels 1-3 are greedy (deflate_fast).
+(defun good-length (level)
   (case level
     (0 0)
-    ((1 2) 4)
-    ((3 4) 32)
-    ((5 6) 128)
-    ((7 8) 512)
-    (9 4096)
+    ((1 2 3) 4)
+    ((4 5) 8)
+    ((6 7) 8)
+    (8 32)
+    (9 32)
+    (otherwise (error 'newzlib-parameter-error
+                      :detail (format nil "invalid compression level ~A" level)))))
+
+(defun lazy-length (level)
+  (case level
+    (0 0)
+    (1 4)
+    (2 5)
+    (3 6)
+    (4 4)
+    (5 16)
+    (6 16)
+    (7 32)
+    (8 128)
+    (9 258)
     (otherwise (error 'newzlib-parameter-error
                       :detail (format nil "invalid compression level ~A" level)))))
 
 (defun nice-length (level)
   (case level
     (0 0)
-    ((1 2) 8)
-    ((3 4) 32)
-    ((5 6) 128)
-    ((7 8) 128)
+    (1 8)
+    (2 16)
+    (3 32)
+    (4 16)
+    (5 32)
+    (6 128)
+    (7 128)
+    (8 258)
     (9 258)
+    (otherwise (error 'newzlib-parameter-error
+                      :detail (format nil "invalid compression level ~A" level)))))
+
+(defun chain-limit (level)
+  (case level
+    (0 0)
+    (1 4)
+    (2 8)
+    (3 32)
+    (4 16)
+    (5 32)
+    (6 128)
+    (7 256)
+    (8 1024)
+    (9 4096)
     (otherwise (error 'newzlib-parameter-error
                       :detail (format nil "invalid compression level ~A" level)))))
 
@@ -44,51 +79,68 @@
 (defun hash-3 (input pos)
   "Hash the three bytes at INPUT[POS..POS+2] into HASH-SIZE buckets."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input)
+           (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum pos))
   (logand (logxor (aref input pos)
-                  (ash (aref input (1+ pos)) 8)
-                  (ash (aref input (+ pos 2)) 16))
+                  (ash (aref input (1+ pos)) 5)
+                  (ash (aref input (+ pos 2)) 10))
           +hash-mask+))
 
 (declaim (inline insert-string))
 (defun insert-string (input pos head prev)
-  "Insert POS into the hash chain for its 3-byte hash."
+  "Insert POS into the hash chain for its 3-byte hash.  Returns the previous
+head of the chain (the position POS is linked after), like zlib's
+INSERT_STRING macro."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input head prev)
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array fixnum (*)) head prev)
            (type fixnum pos))
   (let ((h (hash-3 input pos)))
-    (setf (aref prev (logand pos +window-mask+)) (aref head h)
-          (aref head h) pos)))
+    (let ((old (aref head h)))
+      (setf (aref prev (logand pos +window-mask+)) old
+            (aref head h) pos)
+      old)))
 
-(defun longest-match (input pos end head prev max-chain nice)
-  "Find the longest match for the string starting at INPUT[POS].  Returns
-(VALUES LENGTH DISTANCE), both 0 when no match of at least MIN-MATCH exists."
+(defun longest-match (input pos end first-cand head prev max-chain nice good best-len)
+  "Find the longest match for the string starting at INPUT[POS], ignoring
+matches no longer than BEST-LEN (zlib seeds this with the pending lazy match
+length).  FIRST-CAND is the first chain entry (the hash head captured before
+POS was inserted, so it never equals POS).  Returns (VALUES LENGTH DISTANCE).
+Overlapping matches are allowed (the byte being matched at POS+LEN is the
+byte DISTANCE positions back), so runs longer than the distance are handled."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input head prev)
-           (type fixnum pos end max-chain nice))
-  (let ((best-len 0)
-        (best-dist 0)
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array fixnum (*)) head prev)
+           (type fixnum pos end first-cand max-chain nice good best-len))
+  (let ((best-dist 0)
         (chain 0)
         (limit (max 0 (- pos +max-dist+))))
-    (declare (type fixnum best-len best-dist chain limit))
-    (let ((h (hash-3 input pos)))
-      (loop for cand = (aref head h) then (aref prev (logand cand +window-mask+)) do
+    (declare (type fixnum best-dist chain limit))
+    (when (>= best-len good)
+      (setf max-chain (ash max-chain -2)))
+    (loop for cand = first-cand then (aref prev (logand cand +window-mask+)) do
         (when (or (minusp cand) (< cand limit)) (return))
         (when (>= chain max-chain) (return))
         (incf chain)
-        (let ((len 0))
-          (declare (type fixnum len))
-          (loop while (and (< (+ pos len) end)
-                           (< (+ cand len) pos)
-                           (< len +max-match+)
-                           (= (aref input (+ cand len)) (aref input (+ pos len))))
-                do (incf len))
-          (when (> len best-len)
-            (setf best-len len
-                  best-dist (- pos cand))
-            (when (>= len nice) (return)))))
-      (values best-len best-dist))))
+        (let ((distance (- pos cand)))
+          (declare (type fixnum distance))
+          (when (and (< (+ pos best-len) end)
+                     (= (aref input pos) (aref input cand))
+                     (= (aref input (1+ pos)) (aref input (1+ cand)))
+                     (= (aref input (+ pos best-len)) (aref input (+ cand best-len)))
+                     (= (aref input (+ pos best-len -1)) (aref input (+ cand best-len -1))))
+            (let ((len 2))
+              (declare (type fixnum len))
+              (loop while (and (< (+ pos len) end)
+                               (< len +max-match+)
+                               (= (aref input (+ pos len))
+                                  (aref input (+ pos len (- distance)))))
+                    do (incf len))
+              (when (> len best-len)
+                (setf best-len len
+                      best-dist distance)
+                (when (>= len nice) (return)))))))
+      (values best-len best-dist)))
 
 ;;; ------------------------------------------------------------------
 ;;; LZ77 tokenization
@@ -105,9 +157,12 @@
   "Run LZ77 over INPUT[START,END), filling SYM/DIST/EL/ED (sized to the
 input length) and the symbol frequency vectors.  Returns (VALUES NSYM
 EXTRA-BITS) where EXTRA-BITS is the total number of length/distance extra
-bits across all matches."
+bits across all matches.  Levels 1-3 use greedy matching (deflate_fast),
+levels 4-9 use lazy matching (deflate_slow) which defers each match one
+position and only adopts it if no longer match starts on the next byte."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input sym dist el ed lit-freq dist-freq)
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array fixnum (*)) sym dist el ed lit-freq dist-freq)
            (type fixnum start end level))
   (let* ((head (make-array +hash-size+ :element-type 'fixnum :initial-element -1))
          (prev (make-array +window-size+ :element-type 'fixnum :initial-element -1))
@@ -115,59 +170,126 @@ bits across all matches."
          (extra-bits 0)
          (max-chain (chain-limit level))
          (nice (nice-length level))
+         (good (good-length level))
+         (max-lazy (lazy-length level))
+         (lazy-p (> level 3))
          (pos start))
-    (declare (type fixnum nsym extra-bits max-chain nice pos))
-    (loop while (< pos end) do
-      (if (< (- end pos) +min-match+)
-          (progn
-            (let ((b (aref input pos)))
-              (setf (aref sym nsym) b
-                    (aref dist nsym) 0
-                    (aref el nsym) 0
-                    (aref ed nsym) 0)
-              (incf (aref lit-freq b))
-              (incf nsym))
-            (incf pos))
-          (progn
-            (multiple-value-bind (len d)
-                (longest-match input pos end head prev max-chain nice)
-              (insert-string input pos head prev)
-              (if (>= len +min-match+)
-                  (let* ((code (length-code len))
-                         (dcode (dist-code d)))
-                    (declare (type fixnum code dcode))
-                    (unless (<= d (- pos start))
-                      (error "cl-newzlib internal: distance ~A exceeds emitted ~A at pos ~A"
-                             d (- pos start) pos))
-                    (setf (aref sym nsym) (+ 257 code)
-                          (aref dist nsym) dcode
-                          (aref el nsym) len
-                          (aref ed nsym) d)
-                    (incf (aref lit-freq (+ 257 code)))
-                    (incf (aref dist-freq dcode))
-                    (incf extra-bits (+ (length-extra-bits code)
-                                        (dist-extra-bits dcode)))
-                    (incf nsym)
-                    (loop for q from (1+ pos) below (+ pos len)
-                          do (when (< (+ q 2) end)
-                               (insert-string input q head prev)))
-                    (incf pos len))
+    (declare (type fixnum nsym extra-bits max-chain nice good max-lazy pos))
+    (labels ((emit-literal (p)
+               (let ((b (aref input p)))
+                 (setf (aref sym nsym) b
+                       (aref dist nsym) 0
+                       (aref el nsym) 0
+                       (aref ed nsym) 0)
+                 (incf (aref lit-freq b))
+                 (incf nsym)))
+             (emit-match (len d)
+               (let* ((code (length-code len))
+                      (dcode (dist-code d)))
+                 (declare (type fixnum code dcode))
+                 (setf (aref sym nsym) (+ 257 code)
+                       (aref dist nsym) dcode
+                       (aref el nsym) len
+                       (aref ed nsym) d)
+                 (incf (aref lit-freq (+ 257 code)))
+                 (incf (aref dist-freq dcode))
+                 (incf extra-bits (+ (length-extra-bits code)
+                                     (dist-extra-bits dcode)))
+                 (incf nsym)))
+             (insert-match-interior (mpos mlen)
+               (loop for q from (1+ mpos) below (+ mpos mlen)
+                     do (when (< (+ q 2) end)
+                          (insert-string input q head prev)))))
+      (if lazy-p
+          ;; lazy matching: defer each match one position (zlib deflate_slow)
+          (let ((have-pending nil)
+                (pending-len 0)
+                (pending-dist 0)
+                (pending-pos 0))
+            (declare (type fixnum pending-len pending-dist pending-pos))
+            (loop while (< pos end) do
+              (if (< (- end pos) +min-match+)
+                  ;; no room to search for a new match: flush any pending
+                  ;; match and emit the remaining bytes as literals
                   (progn
-                    (let ((b (aref input pos)))
-                      (setf (aref sym nsym) b
-                            (aref dist nsym) 0
-                            (aref el nsym) 0
-                            (aref ed nsym) 0)
-                      (incf (aref lit-freq b))
-                      (incf nsym))
-                    (incf pos)))))))
+                    (when have-pending
+                      (if (>= pending-len +min-match+)
+                          (progn
+                            (emit-match pending-len pending-dist)
+                            (setf pos (+ pending-pos pending-len)))
+                          (progn
+                            (emit-literal pending-pos)
+                            (setf pos (1+ pending-pos))))
+                      (setf have-pending nil))
+                    (loop while (< pos end) do
+                      (emit-literal pos)
+                      (incf pos)))
+                  (progn
+                    (let ((cand (insert-string input pos head prev)))
+                      (let ((mlen 0) (mdist 0))
+                        (declare (type fixnum mlen mdist))
+                        (when (or (not have-pending)
+                                  (< pending-len max-lazy))
+                          (multiple-value-bind (len d)
+                              (longest-match input pos end cand head prev max-chain
+                                             nice good
+                                             (if have-pending pending-len (1- +min-match+)))
+                            (setf mlen len mdist d)))
+                      (cond
+                        ;; the pending match is at least as good: emit it
+                        ((and have-pending
+                              (>= pending-len +min-match+)
+                              (<= mlen pending-len))
+                         (emit-match pending-len pending-dist)
+                         (insert-match-interior pending-pos pending-len)
+                         (setf pos (+ pending-pos pending-len)
+                               have-pending nil))
+                        ;; there is a pending position: output its byte as a
+                        ;; literal, keep the current (longer) match pending
+                        (have-pending
+                         (emit-literal (1- pos))
+                         (incf pos)
+                         (setf pending-len mlen
+                               pending-dist mdist
+                               pending-pos (1- pos)))
+                        ;; nothing pending: wait for the next step to decide
+                        (t
+                         (setf have-pending t
+                               pending-len mlen
+                               pending-dist mdist
+                               pending-pos pos)
+                         (incf pos))))))))
+            ;; flush any pending match at end of input
+            (when have-pending
+              (if (>= pending-len +min-match+)
+                  (emit-match pending-len pending-dist)
+                  (emit-literal pending-pos))))
+          ;; greedy matching (zlib deflate_fast)
+          (loop while (< pos end) do
+            (if (< (- end pos) +min-match+)
+                (progn
+                  (emit-literal pos)
+                  (incf pos))
+                (progn
+                  (let ((cand (insert-string input pos head prev)))
+                    (multiple-value-bind (len d)
+                        (longest-match input pos end cand head prev max-chain nice
+                                       good (1- +min-match+))
+                      (if (>= len +min-match+)
+                          (progn
+                            (emit-match len d)
+                            (insert-match-interior pos len)
+                            (incf pos len))
+                          (progn
+                            (emit-literal pos)
+                            (incf pos)))))))))
     (setf (aref sym nsym) 256
           (aref dist nsym) 0
           (aref el nsym) 0
           (aref ed nsym) 0)
     (incf (aref lit-freq 256))
     (incf nsym)
-    (values nsym extra-bits)))
+    (values nsym extra-bits))))
 
 ;;; ------------------------------------------------------------------
 ;;; Block emission

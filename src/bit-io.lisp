@@ -143,6 +143,31 @@ be <= 48 when bytes remain, else error is signalled on refill."
     (refill-reader reader))
   (logand (br-accum reader) (1- (ash 1 count))))
 
+(declaim (inline peek-bits-capped))
+(defun peek-bits-capped (reader count)
+  "Peek up to COUNT bits, refilling as possible without signalling on end
+  of input.  Returns (VALUES VALUE AVAILABLE) where AVAILABLE is the number
+  of valid bits in VALUE; VALUE's high bits beyond AVAILABLE are zero."
+  (declare (optimize (speed 3) (safety 0))
+           (type fixnum count))
+  (let ((nbits (br-nbits reader)))
+    (declare (type fixnum nbits))
+    (when (< nbits count)
+      (let ((pos (br-pos reader))
+            (end (br-end reader))
+            (buffer (br-buffer reader))
+            (accum (br-accum reader)))
+        (declare (type fixnum pos end)
+                 (type (unsigned-byte 64) accum))
+        (loop while (and (< nbits count) (< pos end)) do
+          (setf accum (logior accum (ash (aref buffer pos) nbits))
+                nbits (+ nbits 8)
+                pos (1+ pos)))
+        (setf (br-accum reader) accum
+              (br-pos reader) pos
+              (br-nbits reader) nbits)))
+    (values (logand (br-accum reader) (1- (ash 1 count))) nbits)))
+
 (declaim (inline read-bits))
 (defun read-bits (reader count)
   "Consume and return the next COUNT bits of READER, LSB-first."

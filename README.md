@@ -82,4 +82,4 @@ rest of the suite runs without it.
 
 ## Status
 
-The full suite passes: 1416 checks, 0 failures.
+The full suite passes: 1421 checks, 0 failures.

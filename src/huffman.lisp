@@ -91,23 +91,34 @@
 
 (defstruct (huffman-decode-table
             (:conc-name hdt-)
-            (:constructor make-hdt (counts first offsets symbols max-length)))
+            (:constructor make-hdt (counts first offsets symbols max-length
+                                          root fast index-root)))
   ;; counts[l]    : number of symbols with code length l
   ;; first[l]     : canonical first code value of length l (zlib's first[])
   ;; offsets[l]   : index into symbols where length-l symbols start
   ;; symbols      : symbols ordered by (length, canonical code)
   ;; max-length   : longest code length in the table
+  ;; root         : bits looked up at once in FAST (table size 2^ROOT)
+  ;; fast         : 2^ROOT table; entry 0 = slow path (code longer than ROOT),
+  ;;                else (LENGTH << 9) | SYMBOL for a code of LENGTH <= ROOT
+  ;; index-root   : number of symbols with code length <= ROOT
   (counts nil :read-only t)
   (first nil :read-only t)
   (offsets nil :read-only t)
   (symbols nil :read-only t)
-  (max-length 0 :read-only t :type fixnum))
+  (max-length 0 :read-only t :type fixnum)
+  (root 0 :read-only t :type fixnum)
+  (fast nil :read-only t)
+  (index-root 0 :read-only t :type fixnum))
 
-(defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths)))
+(defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
+                                             (root 9))
   "Build a canonical Huffman decode table from the code lengths in
-LENGTHS[START,START+N).  Returns a HUFFMAN-DECODE-TABLE."
+LENGTHS[START,START+N).  ROOT bits are looked up at once through a fast
+jump table; codes longer than ROOT fall back to a canonical walk.  Returns
+a HUFFMAN-DECODE-TABLE."
   (declare (type simple-array lengths)
-           (type fixnum start n)
+           (type fixnum start n root)
            (optimize (speed 3) (safety 0)))
   (let ((counts (make-array (1+ +max-code-length+) :element-type 'fixnum
                             :initial-element 0))
@@ -143,28 +154,68 @@ LENGTHS[START,START+N).  Returns a HUFFMAN-DECODE-TABLE."
               (incf k)))))
       (loop for l from +max-code-length+ downto 1
             when (plusp (aref counts l)) do (setf max-length l) (return))
-      (make-hdt counts first offsets symbols max-length))))
+      (let ((root (min (max 1 root) max-length)))
+        (declare (type fixnum root))
+        (let* ((size (ash 1 root))
+               (fast (make-array size :element-type 'fixnum :initial-element 0))
+               (index-root 0))
+          (declare (type fixnum size index-root))
+          (loop for l from 1 to root do (incf index-root (aref counts l)))
+          ;; for each code length L <= ROOT, fill the indices whose low L
+          ;; bits equal the bit-reversed (LSB-first) code of every symbol of
+          ;; length L, so that the table is keyed by the reader's hold value
+          (loop for l from 1 to root
+                when (plusp (aref counts l)) do
+            (loop for k from (aref offsets l) below (+ (aref offsets l)
+                                                       (aref counts l)) do
+              (let* ((sym (aref symbols k))
+                     (entry (logior (ash l 9) sym))
+                     (c (+ (aref first l) (- k (aref offsets l))))
+                     (idx (reverse-bits c l)))
+                (declare (type fixnum sym entry c idx))
+                (dotimes (i (ash 1 (- root l)))
+                  (setf (aref fast idx) entry)
+                  (incf idx (ash 1 l))))))
+          (make-hdt counts first offsets symbols max-length root fast index-root))))))
 
 (declaim (inline huffman-decode))
 (defun huffman-decode (table reader)
-  "Decode the next Huffman symbol from READER using TABLE.
-Reads one bit at a time until a code matches (canonical decode)."
+  "Decode the next Huffman symbol from READER using TABLE.  Looks up the
+first ROOT bits through a jump table; only codes longer than ROOT fall
+back to reading bits one at a time."
   (declare (type huffman-decode-table table)
            (optimize (speed 3) (safety 0)))
-  (let ((counts (hdt-counts table))
-        (first (hdt-first table))
-        (symbols (hdt-symbols table)))
-    (let ((code 0) (index 0))
-      (declare (type fixnum code index))
-      (block decode
-        (loop for len fixnum from 1 to +max-code-length+ do
-          (setf code (logior (ash code 1) (read-bits reader 1)))
-          (let ((count (aref counts len)))
-            (declare (type fixnum count))
-            (when (< (- code count) (aref first len))
-              (return-from decode (aref symbols (+ index (- code (aref first len))))))
-            (setf index (+ index count))))
-        (error 'newzlib-format-error :detail "invalid Huffman code")))))
+  (let* ((root (hdt-root table))
+         (v (peek-bits-capped reader root))
+         (entry (aref (hdt-fast table) v)))
+    (declare (type fixnum root v entry))
+    (if (zerop entry)
+        ;; slow path: code longer than ROOT bits; consume the ROOT bits we
+        ;; peeked, then walk the remaining bits, accumulating the canonical
+        ;; code MSB-first (bit-reversing the ROOT bits we already hold)
+        (let ((counts (hdt-counts table))
+              (first (hdt-first table))
+              (symbols (hdt-symbols table))
+              (code (reverse-bits v root))
+              (index (hdt-index-root table))
+              (len root))
+          (declare (type fixnum code index len))
+          (read-bits reader root)
+          (block decode
+            (loop do
+              (incf len)
+              (setf code (logior (ash code 1) (read-bits reader 1)))
+              (let ((count (aref counts len)))
+                (declare (type fixnum count))
+                (when (< (- code count) (aref first len))
+                  (return-from decode
+                    (aref symbols (+ index (- code (aref first len))))))
+                (setf index (+ index count))))
+            (error 'newzlib-format-error :detail "invalid Huffman code")))
+        ;; fast path
+        (progn
+          (read-bits reader (ash entry -9))
+          (logand entry #x1FF)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Static tree tables (fixed blocks)

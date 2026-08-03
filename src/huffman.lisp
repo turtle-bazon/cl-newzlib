@@ -18,16 +18,25 @@
 (defconstant +end-block+ 256)
 
 (defparameter +length-extra-bits+
-  #(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0))
+  (make-array 29 :element-type '(unsigned-byte 8)
+              :initial-contents '(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3
+                                  4 4 4 4 5 5 5 5 0)))
 (defparameter +length-base+
-  #(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258))
+  (make-array 29 :element-type '(unsigned-byte 16)
+              :initial-contents '(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31
+                                  35 43 51 59 67 83 99 115 131 163 195 227 258)))
 (defparameter +dist-extra-bits+
-  #(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13))
+  (make-array 30 :element-type '(unsigned-byte 8)
+              :initial-contents '(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6
+                                  7 7 8 8 9 9 10 10 11 11 12 12 13 13)))
 (defparameter +dist-base+
-  #(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769
-       1025 1537 2049 3073 4097 6145 8193 12289 16385 24577))
+  (make-array 30 :element-type '(unsigned-byte 16)
+              :initial-contents '(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193
+                                  257 385 513 769 1025 1537 2049 3073 4097
+                                  6145 8193 12289 16385 24577)))
 (defparameter +code-length-order+
-  #(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15))
+  (make-array 19 :element-type '(unsigned-byte 8)
+              :initial-contents '(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15)))
 
 ;;; Map match lengths (3..258) to length codes (0..28), and distances
 ;;; (1..32768) to distance codes (0..29), using zlib's construction.
@@ -102,13 +111,13 @@
   ;; fast         : 2^ROOT table; entry 0 = slow path (code longer than ROOT),
   ;;                else (LENGTH << 9) | SYMBOL for a code of LENGTH <= ROOT
   ;; index-root   : number of symbols with code length <= ROOT
-  (counts nil :read-only t)
-  (first nil :read-only t)
-  (offsets nil :read-only t)
-  (symbols nil :read-only t)
+  (counts nil :read-only t :type (simple-array fixnum (*)))
+  (first nil :read-only t :type (simple-array fixnum (*)))
+  (offsets nil :read-only t :type (simple-array fixnum (*)))
+  (symbols nil :read-only t :type (simple-array fixnum (*)))
   (max-length 0 :read-only t :type fixnum)
   (root 0 :read-only t :type fixnum)
-  (fast nil :read-only t)
+  (fast nil :read-only t :type (simple-array fixnum (*)))
   (index-root 0 :read-only t :type fixnum))
 
 (defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
@@ -186,9 +195,11 @@ back to reading bits one at a time."
   (declare (type huffman-decode-table table)
            (optimize (speed 3) (safety 0)))
   (let* ((root (hdt-root table))
+         (fast (hdt-fast table))
          (v (peek-bits-capped reader root))
-         (entry (aref (hdt-fast table) v)))
-    (declare (type fixnum root v entry))
+         (entry (aref fast v)))
+    (declare (type fixnum root v entry)
+             (type (simple-array fixnum (*)) fast))
     (if (zerop entry)
         ;; slow path: code longer than ROOT bits; consume the ROOT bits we
         ;; peeked, then walk the remaining bits, accumulating the canonical
@@ -199,7 +210,8 @@ back to reading bits one at a time."
               (code (reverse-bits v root))
               (index (hdt-index-root table))
               (len root))
-          (declare (type fixnum code index len))
+          (declare (type fixnum code index len)
+                   (type (simple-array fixnum (*)) counts first symbols))
           (read-bits reader root)
           (block decode
             (loop do

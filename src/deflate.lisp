@@ -112,35 +112,70 @@ byte DISTANCE positions back), so runs longer than the distance are handled."
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array fixnum (*)) head prev)
            (type fixnum pos end first-cand max-chain nice good best-len))
-  (let ((best-dist 0)
-        (chain 0)
-        (limit (max 0 (- pos +max-dist+))))
-    (declare (type fixnum best-dist chain limit))
-    (when (>= best-len good)
-      (setf max-chain (ash max-chain -2)))
-    (loop for cand = first-cand then (aref prev (logand cand +window-mask+)) do
-        (when (or (minusp cand) (< cand limit)) (return))
-        (when (>= chain max-chain) (return))
-        (incf chain)
-        (let ((distance (- pos cand)))
-          (declare (type fixnum distance))
-          (when (and (< (+ pos best-len) end)
-                     (= (aref input pos) (aref input cand))
-                     (= (aref input (1+ pos)) (aref input (1+ cand)))
-                     (= (aref input (+ pos best-len)) (aref input (+ cand best-len)))
-                     (= (aref input (+ pos best-len -1)) (aref input (+ cand best-len -1))))
-            (let ((len 2))
-              (declare (type fixnum len))
-              (loop while (and (< (+ pos len) end)
-                               (< len +max-match+)
-                               (= (aref input (+ pos len))
-                                  (aref input (+ pos len (- distance)))))
-                    do (incf len))
-              (when (> len best-len)
-                (setf best-len len
-                      best-dist distance)
-                (when (>= len nice) (return)))))))
-      (values best-len best-dist)))
+  (labels ((extend-match (cand start-len)
+             "Longest run INPUT[POS+LEN..] == INPUT[CAND+LEN..] starting at
+START-LEN, bounded by END and +MAX-MATCH+."
+             (declare (type fixnum cand start-len))
+             #+sbcl
+             (let* ((base (sb-sys:vector-sap input))
+                    (len start-len))
+               (declare (type fixnum len))
+               ;; compare four bytes at a time; INPUT is pinned for the whole
+               ;; LENGTH clause and the unaligned reads stay inside END.
+               (loop while (and (< (+ pos 4 len) end)
+                                (< len +max-match+)
+                                (= (sb-sys:sap-ref-32 base (+ pos len))
+                                   (sb-sys:sap-ref-32 base (+ cand len))))
+                     do (incf len 4))
+               (loop while (and (< (+ pos len) end)
+                                (< len +max-match+)
+                                (= (aref input (+ pos len))
+                                   (aref input (+ cand len))))
+                     do (incf len))
+               len)
+             #-sbcl
+             (let ((len start-len))
+               (declare (type fixnum len))
+               (loop while (and (< (+ pos len) end)
+                                (< len +max-match+)
+                                (= (aref input (+ pos len))
+                                   (aref input (+ cand len))))
+                     do (incf len))
+               len))
+           (walk ()
+             (let ((best-dist 0)
+                   (chain 0)
+                   (limit (max 0 (- pos +max-dist+))))
+               (declare (type fixnum best-dist chain limit))
+               (when (>= best-len good)
+                 (setf max-chain (ash max-chain -2)))
+               ;; INPUT[POS..POS+1] never change across candidates, so hoist
+               ;; them out of the walk; only the best-len-dependent and
+               ;; candidate bytes stay inline.
+               (let ((p0 (aref input pos))
+                     (p1 (aref input (1+ pos))))
+                 (declare (type fixnum p0 p1))
+                 (loop for cand = first-cand then (aref prev (logand cand +window-mask+)) do
+                   (when (or (minusp cand) (< cand limit)) (return))
+                   (when (>= chain max-chain) (return))
+                   (incf chain)
+                   (when (and (= p0 (aref input cand))
+                              (= p1 (aref input (1+ cand)))
+                              (< (+ pos best-len) end)
+                              (= (aref input (+ pos best-len)) (aref input (+ cand best-len)))
+                              (= (aref input (+ pos best-len -1)) (aref input (+ cand best-len -1))))
+                     (let ((distance (- pos cand)))
+                       (declare (type fixnum distance))
+                       (let ((len (extend-match cand 2)))
+                         (declare (type fixnum len))
+                         (when (> len best-len)
+                           (setf best-len len
+                                 best-dist distance)
+                           (when (>= len nice) (return))))))))
+               (values best-len best-dist))))
+    (declare (inline extend-match walk))
+    #+sbcl (sb-sys:with-pinned-objects (input) (walk))
+    #-sbcl (walk)))
 
 ;;; ------------------------------------------------------------------
 ;;; LZ77 tokenization
@@ -197,9 +232,21 @@ position and only adopts it if no longer match starts on the next byte."
                                      (dist-extra-bits dcode)))
                  (incf nsym)))
              (insert-match-interior (mpos mlen start)
-               (loop for q from start below (+ mpos mlen)
-                     do (when (< (+ q 2) end)
-                          (insert-string input q head prev)))))
+               (let ((limit (min (+ mpos mlen) (- end 2))))
+                 (declare (type fixnum limit))
+                 ;; rolling 3-byte hash: keep INPUT[Q..Q+2] in locals so each
+                 ;; consecutive insertion reads only one fresh byte instead of
+                 ;; recomputing HASH-3's three loads from scratch.
+                 (loop for q from start below limit
+                       for a = (aref input q) then b
+                       for b = (aref input (1+ q)) then c
+                       for c = (aref input (+ q 2))
+                       do (let ((h (logand (logxor a (ash b 5) (ash c 10))
+                                           +hash-mask+)))
+                            (declare (type fixnum h))
+                            (let ((old (aref head h)))
+                              (setf (aref prev (logand q +window-mask+)) old
+                                    (aref head h) q)))))))
       (if lazy-p
           ;; lazy matching: defer each match one position (zlib deflate_slow)
           (let ((have-pending nil)

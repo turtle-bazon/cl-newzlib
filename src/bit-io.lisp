@@ -17,7 +17,7 @@
             (:conc-name bw-)
             (:predicate nil)
             (:copier nil))
-  (buffer nil :type simple-array)   ; simple-array (unsigned-byte 8)
+  (buffer nil :type (simple-array (unsigned-byte 8) (*))) ; output octets
   (size 0 :type fixnum)             ; capacity of buffer
   (pos 0 :type fixnum)              ; number of bytes committed
   (accum 0 :type (unsigned-byte 64)); pending bits, low NBITS significant
@@ -26,6 +26,14 @@
 (defun make-bit-writer (initial-size)
   (%make-bit-writer :buffer (make-octet-buffer initial-size)
                     :size initial-size))
+
+;;; Precomputed (1- (ash 1 count)) for COUNT in 0..63, as unsigned-byte 64.
+;;; Indexing this table avoids the bignum-allocation guard SBCL would emit
+;;; for an unconstrained (ASH 1 COUNT) on every bit-I/O call.
+(defconstant +low-bit-masks+
+  (coerce (loop for i from 0 below 64
+                collect (ldb (byte 64 0) (1- (ash 1 i))))
+          '(simple-array (unsigned-byte 64) (64))))
 
 (declaim (inline grow-buffer))
 (defun grow-buffer (buffer size)
@@ -73,9 +81,11 @@
            (type (unsigned-byte 64) bits)
            (type fixnum count))
   (setf (bw-accum writer)
-        (logior (bw-accum writer)
-                (ash (logand bits (1- (ash 1 count)))
-                     (bw-nbits writer)))
+        (definitely-the
+            (unsigned-byte 64)
+          (logior (bw-accum writer)
+                  (ash (logand bits (aref +low-bit-masks+ count))
+                       (bw-nbits writer))))
         (bw-nbits writer) (+ (bw-nbits writer) count))
   (when (>= (bw-nbits writer) 8)
     (flush-pending-bytes writer))
@@ -108,7 +118,7 @@
             (:conc-name br-)
             (:predicate nil)
             (:copier nil))
-  (buffer nil :type simple-array)   ; input octet vector
+  (buffer nil :type (simple-array (unsigned-byte 8) (*))) ; input octets
   (pos 0 :type fixnum)              ; next byte index in buffer
   (end 0 :type fixnum)              ; one past last available byte
   (accum 0 :type (unsigned-byte 64)); pending bits, low NBITS significant
@@ -123,14 +133,21 @@
 NEWZLIB-END-OF-INPUT when no bytes remain."
   (declare (optimize (speed 3) (safety 0)))
   (let ((pos (br-pos reader))
-        (end (br-end reader)))
+        (end (br-end reader))
+        (buffer (br-buffer reader))
+        (accum (br-accum reader))
+        (nbits (br-nbits reader)))
+    (declare (type fixnum pos end nbits)
+             (type (unsigned-byte 64) accum)
+             (type (simple-array (unsigned-byte 8) (*)) buffer))
     (when (>= pos end)
       (error 'newzlib-end-of-input))
     (setf (br-accum reader)
-          (logior (br-accum reader)
-                  (ash (aref (br-buffer reader) pos) (br-nbits reader)))
+          (definitely-the
+              (unsigned-byte 64)
+            (logior accum (ash (aref buffer pos) nbits)))
           (br-pos reader) (1+ pos)
-          (br-nbits reader) (+ (br-nbits reader) 8)))
+          (br-nbits reader) (+ nbits 8)))
   nil)
 
 (declaim (inline peek-bits))
@@ -141,7 +158,7 @@ be <= 48 when bytes remain, else error is signalled on refill."
            (type fixnum count))
   (loop while (< (br-nbits reader) count) do
     (refill-reader reader))
-  (logand (br-accum reader) (1- (ash 1 count))))
+  (logand (br-accum reader) (aref +low-bit-masks+ count)))
 
 (declaim (inline peek-bits-capped))
 (defun peek-bits-capped (reader count)
@@ -158,15 +175,19 @@ be <= 48 when bytes remain, else error is signalled on refill."
             (buffer (br-buffer reader))
             (accum (br-accum reader)))
         (declare (type fixnum pos end)
-                 (type (unsigned-byte 64) accum))
+                 (type (unsigned-byte 64) accum)
+                 (type (simple-array (unsigned-byte 8) (*)) buffer))
         (loop while (and (< nbits count) (< pos end)) do
-          (setf accum (logior accum (ash (aref buffer pos) nbits))
+          (setf accum (logior accum
+                              (definitely-the
+                                  (unsigned-byte 64)
+                                (ash (aref buffer pos) nbits)))
                 nbits (+ nbits 8)
                 pos (1+ pos)))
         (setf (br-accum reader) accum
               (br-pos reader) pos
               (br-nbits reader) nbits)))
-    (values (logand (br-accum reader) (1- (ash 1 count))) nbits)))
+    (values (logand (br-accum reader) (aref +low-bit-masks+ count)) nbits)))
 
 (declaim (inline read-bits))
 (defun read-bits (reader count)
@@ -175,6 +196,9 @@ be <= 48 when bytes remain, else error is signalled on refill."
            (type fixnum count))
   (loop while (< (br-nbits reader) count) do
     (refill-reader reader))
-  (prog1 (logand (br-accum reader) (1- (ash 1 count)))
-    (setf (br-accum reader) (ash (br-accum reader) (- count))
+  (prog1 (logand (br-accum reader) (aref +low-bit-masks+ count))
+    (setf (br-accum reader)
+          (definitely-the
+              (unsigned-byte 64)
+            (ash (br-accum reader) (- count)))
           (br-nbits reader) (- (br-nbits reader) count))))

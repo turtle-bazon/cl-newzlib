@@ -3,6 +3,13 @@
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))
 
+;;; SBCL-specific: assert an arithmetic RESULT type so the compiler emits a
+;;; narrow VOP instead of a generic/bignum-safe fallback for the hot bit-I/O
+;;; shifts.  On other implementations it degrades to the standard THE.
+(defmacro definitely-the (type form)
+  #+sbcl `(sb-ext:truly-the ,type ,form)
+  #-sbcl `(the ,type ,form))
+
 ;;; Compression level constants, mirroring zlib's Z_NO_COMPRESSION (0),
 ;;; Z_BEST_SPEED (1), Z_DEFAULT_COMPRESSION (-1) and Z_BEST_COMPRESSION (9).
 (defparameter +no-compression+ 0)

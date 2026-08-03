@@ -21,13 +21,6 @@ inflater builds canonical decode tables with a Kraft-inequality check.
 
 Both are available through Quicklisp.
 
-## Loading
-
-```lisp
-(push #p"/path/to/cl-newzlib/" asdf:*central-registry*)
-(asdf:load-system "cl-newzlib")
-```
-
 ## One-shot API
 
 ```lisp
@@ -72,7 +65,6 @@ and cross-checks against the system C zlib via CFFI (raw/zlib/gzip roundtrips
 in both directions, checksum comparison, window/boundary behaviour).
 
 ```lisp
-(push #p"/path/to/cl-newzlib/" asdf:*central-registry*)
 (asdf:load-system "cl-newzlib-tests")
 (cl-newzlib-tests:run-tests)
 ```

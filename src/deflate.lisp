@@ -196,8 +196,8 @@ position and only adopts it if no longer match starts on the next byte."
                  (incf extra-bits (+ (length-extra-bits code)
                                      (dist-extra-bits dcode)))
                  (incf nsym)))
-             (insert-match-interior (mpos mlen)
-               (loop for q from (1+ mpos) below (+ mpos mlen)
+             (insert-match-interior (mpos mlen start)
+               (loop for q from start below (+ mpos mlen)
                      do (when (< (+ q 2) end)
                           (insert-string input q head prev)))))
       (if lazy-p
@@ -241,7 +241,7 @@ position and only adopts it if no longer match starts on the next byte."
                               (>= pending-len +min-match+)
                               (<= mlen pending-len))
                          (emit-match pending-len pending-dist)
-                         (insert-match-interior pending-pos pending-len)
+                         (insert-match-interior pending-pos pending-len (+ pending-pos 2))
                          (setf pos (+ pending-pos pending-len)
                                have-pending nil))
                         ;; there is a pending position: output its byte as a
@@ -278,7 +278,8 @@ position and only adopts it if no longer match starts on the next byte."
                       (if (>= len +min-match+)
                           (progn
                             (emit-match len d)
-                            (insert-match-interior pos len)
+                            (when (<= len max-lazy)
+                              (insert-match-interior pos len (1+ pos)))
                             (incf pos len))
                           (progn
                             (emit-literal pos)

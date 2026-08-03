@@ -4,8 +4,9 @@ A zlib-compatible DEFLATE compression library in Common Lisp.
 
 Implements all three related formats in portable Common Lisp:
 
-* **RFC 1951 — DEFLATE** (raw streams, level 0 = stored blocks, levels
-  1/6/9 = greedy LZ77 with fixed or dynamic Huffman coding)
+* **RFC 1951 — DEFLATE** (raw streams; level 0 = stored blocks; levels
+  1-3 = greedy LZ77, 4-9 = lazy matching, all with fixed or dynamic
+  Huffman coding)
 * **RFC 1950 — zlib wrapper**
 * **RFC 1952 — gzip wrapper**
 
@@ -45,8 +46,6 @@ cl-newzlib:gzip-compress / gzip-decompress  ; RFC 1952
 ## Streaming API
 
 ```lisp
-cl-newzlib:deflate-stream      ; compress a stream into an octet vector
-cl-newzlib:inflate-stream      ; decompress a stream, incremental reads
 cl-newzlib:make-deflate-stream ; / deflate-stream-write / deflate-stream-finish / deflate-stream-end
 cl-newzlib:make-inflate-stream ; / inflate-stream-read / inflate-stream-eof-p / inflate-stream-end
 ```

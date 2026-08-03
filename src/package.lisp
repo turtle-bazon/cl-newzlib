@@ -26,7 +26,7 @@
    #:gzip-decompress
    #:raw-deflate
    #:raw-inflate
-   ;; Compression level / strategy constants
+   ;; Compression level constants
    #:compression-level-no-compression
    #:compression-level-fastest
    #:compression-level-default

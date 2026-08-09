@@ -30,7 +30,7 @@
 ;;; Precomputed (1- (ash 1 count)) for COUNT in 0..63, as unsigned-byte 64.
 ;;; Indexing this table avoids the bignum-allocation guard SBCL would emit
 ;;; for an unconstrained (ASH 1 COUNT) on every bit-I/O call.
-(defconstant +low-bit-masks+
+(defvar +low-bit-masks+
   (coerce (loop for i from 0 below 64
                 collect (ldb (byte 64 0) (1- (ash 1 i))))
           '(simple-array (unsigned-byte 64) (64))))

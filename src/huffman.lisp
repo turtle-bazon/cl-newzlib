@@ -45,10 +45,11 @@
         (length 0)
         (code 0))
     (declare (type fixnum length code))
-    (loop while (< code 28) do
+    (iterate:iterate
+      (iterate:while (< code 28))
       (let ((n (ash 1 (aref +length-extra-bits+ code))))
         (declare (type fixnum n))
-        (loop repeat n do
+        (iterate:iterate (iterate:repeat n)
           (setf (aref table length) code
                 length (1+ length)))
         (incf code)))
@@ -60,18 +61,20 @@
         (dist 0)
         (code 0))
     (declare (type fixnum dist code))
-    (loop while (< code 16) do
+    (iterate:iterate
+      (iterate:while (< code 16))
       (let ((n (ash 1 (aref +dist-extra-bits+ code))))
         (declare (type fixnum n))
-        (loop repeat n do
+        (iterate:iterate (iterate:repeat n)
           (setf (aref table dist) code
                 dist (1+ dist)))
         (incf code)))
     (setf dist (ash dist -7))
-    (loop while (< code 30) do
+    (iterate:iterate
+      (iterate:while (< code 30))
       (let ((n (ash 1 (- (aref +dist-extra-bits+ code) 7))))
         (declare (type fixnum n))
-        (loop repeat n do
+        (iterate:iterate (iterate:repeat n)
           (setf (aref table (+ 256 dist)) code
                 dist (1+ dist)))
         (incf code)))

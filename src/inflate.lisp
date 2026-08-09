@@ -81,7 +81,8 @@
     (multiple-value-bind (buffer size)
         (ensure-out-capacity buffer size pos len)
       ;; drain whole bytes still pending in the reader accumulator
-      (loop while (and (plusp len) (>= (br-nbits reader) 8)) do
+      (iterate:iterate
+        (iterate:while (and (plusp len) (>= (br-nbits reader) 8)))
         (setf (aref buffer pos) (read-bits reader 8))
         (incf pos)
         (decf len))
@@ -94,7 +95,8 @@
           (setf (br-pos reader) (+ (br-pos reader) n)
                 pos (+ pos n)
                 len (- len n)))
-        (loop while (plusp len) do
+        (iterate:iterate
+          (iterate:while (plusp len))
           (setf (aref buffer pos) (read-bits reader 8))
           (incf pos)
           (decf len)))
@@ -111,53 +113,54 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
            (type huffman-decode-table lit dist)
            (type (simple-array (unsigned-byte 8) (*)) buffer)
            (type fixnum size pos))
-  (loop do
-    (let ((sym (huffman-decode lit reader)))
-      (declare (type fixnum sym))
-      (cond
-        ((< sym 256)
-         (multiple-value-bind (nbuffer nsize)
-             (ensure-out-capacity buffer size pos 1)
-           (setf buffer nbuffer
-                 size nsize)
-           (setf (aref buffer pos) sym)
-           (incf pos)))
-        ((= sym 256)
-         (loop-finish))
-        (t
-         (when (> sym 285)
-           (error 'newzlib-format-error :detail "invalid length code"))
-         (let* ((code (- sym 257))
-                (length (+ (length-base code) (read-bits reader (length-extra-bits code))))
-                (dcode (huffman-decode dist reader)))
-           (declare (type fixnum code length dcode))
-           (when (> dcode 29)
-             (error 'newzlib-format-error :detail "invalid distance code"))
-           (let ((distance (+ (dist-base dcode)
-                              (read-bits reader (dist-extra-bits dcode)))))
-             (declare (type fixnum distance))
-             (when (> distance pos)
-               (error 'newzlib-format-error :detail "match distance exceeds output"))
-             (let ((src (- pos distance)))
-               (declare (type fixnum src))
-               (multiple-value-bind (nbuffer nsize)
-                   (ensure-out-capacity buffer size pos length)
-                 (setf buffer nbuffer
-                       size nsize)
-                  (if (<= length distance)
-                      ;; non-overlapping copy
-                      (progn
-                        (replace buffer buffer
-                                 :start1 pos :start2 src
-                                 :end1 (+ pos length) :end2 (+ src length))
-                        (incf pos length))
-                      ;; overlapping copy: each byte reads the byte DISTANCE
-                      ;; back, which this same copy has already written
-                      (progn
-                        (loop for i from pos below (+ pos length) do
-                          (setf (aref buffer i) (aref buffer (- i distance))))
-                        (incf pos length)))))))))))
-    (values buffer pos size))
+  (iterate:iterate
+    (iterate:for sym = (huffman-decode lit reader))
+    (declare (type fixnum sym))
+    (cond
+      ((< sym 256)
+       (multiple-value-bind (nbuffer nsize)
+           (ensure-out-capacity buffer size pos 1)
+         (setf buffer nbuffer
+               size nsize)
+         (setf (aref buffer pos) sym)
+         (incf pos)))
+      ((= sym 256)
+       (iterate:leave (values buffer pos size)))
+      (t
+       (when (> sym 285)
+         (error 'newzlib-format-error :detail "invalid length code"))
+       (let* ((code (- sym 257))
+              (length (+ (length-base code) (read-bits reader (length-extra-bits code))))
+              (dcode (huffman-decode dist reader)))
+         (declare (type fixnum code length dcode))
+         (when (> dcode 29)
+           (error 'newzlib-format-error :detail "invalid distance code"))
+         (let ((distance (+ (dist-base dcode)
+                            (read-bits reader (dist-extra-bits dcode)))))
+           (declare (type fixnum distance))
+           (when (> distance pos)
+             (error 'newzlib-format-error :detail "match distance exceeds output"))
+           (let ((src (- pos distance)))
+             (declare (type fixnum src))
+             (multiple-value-bind (nbuffer nsize)
+                 (ensure-out-capacity buffer size pos length)
+               (setf buffer nbuffer
+                     size nsize)
+                (if (<= length distance)
+                    ;; non-overlapping copy
+                    (progn
+                      (replace buffer buffer
+                               :start1 pos :start2 src
+                               :end1 (+ pos length) :end2 (+ src length))
+                      (incf pos length))
+                    ;; overlapping copy: each byte reads the byte DISTANCE
+                    ;; back, which this same copy has already written
+                    (progn
+                      (iterate:iterate
+                        (iterate:for i from pos below (+ pos length))
+                        (setf (aref buffer i) (aref buffer (- i distance))))
+                      (incf pos length))))))))))
+  (values buffer pos size))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------
@@ -177,7 +180,8 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                                  :initial-element 0)))
         (let ((i 0))
           (declare (type fixnum i))
-          (loop while (< i (+ hlit hdist)) do
+          (iterate:iterate
+            (iterate:while (< i (+ hlit hdist)))
             (let ((sym (huffman-decode cl-tree reader)))
               (declare (type fixnum sym))
               (cond
@@ -191,7 +195,7 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                  (let ((rep (+ (read-bits reader 2) 3)))
                    (declare (type fixnum rep))
                    (let ((prev (aref lengths (1- i))))
-                     (loop repeat rep do
+                     (iterate:iterate (iterate:repeat rep)
                        (when (>= i (+ hlit hdist))
                          (error 'newzlib-format-error
                                 :detail "code length repeat overruns table"))
@@ -201,7 +205,7 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                  (let ((rep (+ (read-bits reader (if (= sym 17) 3 7))
                                (if (= sym 17) 3 11))))
                    (declare (type fixnum rep))
-                   (loop repeat rep do
+                   (iterate:iterate (iterate:repeat rep)
                      (when (>= i (+ hlit hdist))
                        (error 'newzlib-format-error
                               :detail "code length repeat overruns table"))
@@ -223,31 +227,31 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
            (type fixnum size pos))
-  (loop do
-    (let ((bfinal (read-bits reader 1))
-          (btype (read-bits reader 2)))
-      (declare (type fixnum bfinal btype))
-      (case btype
-        (0 (multiple-value-bind (nbuffer npos nsize)
-               (inflate-stored-block reader buffer size pos)
+  (iterate:iterate
+    (iterate:for bfinal = (read-bits reader 1))
+    (iterate:for btype = (read-bits reader 2))
+    (declare (type fixnum bfinal btype))
+    (case btype
+      (0 (multiple-value-bind (nbuffer npos nsize)
+             (inflate-stored-block reader buffer size pos)
+           (setf buffer nbuffer
+                 pos npos
+                 size nsize)))
+      (1 (multiple-value-bind (lit dist) (ensure-fixed-tables)
+           (multiple-value-bind (nbuffer npos nsize)
+               (inflate-token-stream reader buffer size pos lit dist)
              (setf buffer nbuffer
                    pos npos
-                   size nsize)))
-        (1 (multiple-value-bind (lit dist) (ensure-fixed-tables)
-             (multiple-value-bind (nbuffer npos nsize)
-                 (inflate-token-stream reader buffer size pos lit dist)
-               (setf buffer nbuffer
-                     pos npos
-                     size nsize))))
-        (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader)
-             (multiple-value-bind (nbuffer npos nsize)
-                 (inflate-token-stream reader buffer size pos lit dist)
-               (setf buffer nbuffer
-                     pos npos
-                     size nsize))))
-        (otherwise (error 'newzlib-format-error :detail "invalid block type")))
-      (when (plusp bfinal)
-        (loop-finish))))
+                   size nsize))))
+      (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader)
+           (multiple-value-bind (nbuffer npos nsize)
+               (inflate-token-stream reader buffer size pos lit dist)
+             (setf buffer nbuffer
+                   pos npos
+                   size nsize))))
+      (otherwise (error 'newzlib-format-error :detail "invalid block type")))
+    (when (plusp bfinal)
+      (iterate:leave (values buffer pos size))))
   (values buffer pos size))
 
 (defun inflate-raw (input &optional (start 0) (end (length input)))

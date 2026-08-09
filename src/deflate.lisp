@@ -440,46 +440,47 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
           (min-count 4))
       (declare (type fixnum nextlen max-count min-count))
       (when (zerop nextlen) (setf max-count 138 min-count 3))
-      (loop for idx from 0 below n do
-        (let ((curlen nextlen))
-          (setf nextlen (if (< idx (1- n)) (aref lengths (1+ idx)) -1))
-          (incf count)
-          (unless (and (< count max-count) (= curlen nextlen))
-            (cond
-              ((< count min-count)
-               (loop repeat count do
-                 (setf (aref bl-sym nbl) curlen
-                       (aref bl-extra nbl) 0)
-                 (incf (aref bl-freq curlen))
-                 (incf nbl)))
-              ((not (zerop curlen))
-               (when (/= curlen prevlen)
-                 (setf (aref bl-sym nbl) curlen
-                       (aref bl-extra nbl) 0)
-                 (incf (aref bl-freq curlen))
-                 (incf nbl)
-                 (decf count))
-               (setf (aref bl-sym nbl) 16
-                     (aref bl-extra nbl) (- count 3))
-               (incf (aref bl-freq 16))
-               (incf extra-bits 2)
-               (incf nbl))
-              ((<= count 10)
-               (setf (aref bl-sym nbl) 17
-                     (aref bl-extra nbl) (- count 3))
-               (incf (aref bl-freq 17))
-               (incf extra-bits 3)
-               (incf nbl))
-              (t
-               (setf (aref bl-sym nbl) 18
-                     (aref bl-extra nbl) (- count 11))
-               (incf (aref bl-freq 18))
-               (incf extra-bits 7)
+      (iterate:iterate
+        (iterate:for idx from 0 below n)
+        (iterate:for curlen = nextlen)
+        (setf nextlen (if (< idx (1- n)) (aref lengths (1+ idx)) -1))
+        (incf count)
+        (unless (and (< count max-count) (= curlen nextlen))
+          (cond
+            ((< count min-count)
+             (iterate:iterate (iterate:repeat count)
+               (setf (aref bl-sym nbl) curlen
+                     (aref bl-extra nbl) 0)
+               (incf (aref bl-freq curlen))
                (incf nbl)))
-            (setf count 0 prevlen curlen)
-            (cond ((zerop nextlen) (setf max-count 138 min-count 3))
-                  ((= curlen nextlen) (setf max-count 6 min-count 3))
-                  (t (setf max-count 7 min-count 4))))))
+            ((not (zerop curlen))
+             (when (/= curlen prevlen)
+               (setf (aref bl-sym nbl) curlen
+                     (aref bl-extra nbl) 0)
+               (incf (aref bl-freq curlen))
+               (incf nbl)
+               (decf count))
+             (setf (aref bl-sym nbl) 16
+                   (aref bl-extra nbl) (- count 3))
+             (incf (aref bl-freq 16))
+             (incf extra-bits 2)
+             (incf nbl))
+            ((<= count 10)
+             (setf (aref bl-sym nbl) 17
+                   (aref bl-extra nbl) (- count 3))
+             (incf (aref bl-freq 17))
+             (incf extra-bits 3)
+             (incf nbl))
+            (t
+             (setf (aref bl-sym nbl) 18
+                   (aref bl-extra nbl) (- count 11))
+             (incf (aref bl-freq 18))
+             (incf extra-bits 7)
+             (incf nbl)))
+          (setf count 0 prevlen curlen)
+          (cond ((zerop nextlen) (setf max-count 138 min-count 3))
+                ((= curlen nextlen) (setf max-count 6 min-count 3))
+                (t (setf max-count 7 min-count 4)))))
       (values nbl extra-bits))))
 
 (defun emit-dynamic-block (writer sym dist el ed nsym bfinal

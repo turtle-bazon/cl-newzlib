@@ -281,6 +281,10 @@ can be emitted directly with the LSB-first writer."
 (defparameter +static-dist-codes+ nil)
 (defparameter +static-dist-lengths+ nil)
 
+(declaim (type (or null (simple-array fixnum (*)))
+               +static-lit-codes+ +static-lit-lengths+
+               +static-dist-codes+ +static-dist-lengths+))
+
 (defun ensure-static-trees ()
   (unless +static-lit-codes+
     (multiple-value-bind (codes lengths)

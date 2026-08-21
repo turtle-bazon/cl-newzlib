@@ -25,6 +25,8 @@
 (defparameter +fixed-lit-table+ nil)
 (defparameter +fixed-dist-table+ nil)
 
+(declaim (type (or null huffman-decode-table) +fixed-lit-table+ +fixed-dist-table+))
+
 (defun ensure-fixed-tables ()
   (unless +fixed-lit-table+
     (setf +fixed-lit-table+ (build-huffman-decode-table +fixed-lit-lengths+)
@@ -57,8 +59,10 @@
            (type fixnum size pos need))
   (if (<= (+ pos need) size)
       (values buffer size)
+      ;; grow 4x at a time: repeated doubling spends ~1x of the final size
+      ;; in copied bytes, 4x growth spends ~1/3x
       (let ((new-size size))
-        (loop while (< new-size (+ pos need)) do (setf new-size (* 2 new-size)))
+        (loop while (< new-size (+ pos need)) do (setf new-size (* 4 new-size)))
         (let ((new (make-octet-buffer new-size)))
           (replace new buffer :end2 size)
           (values new new-size)))))

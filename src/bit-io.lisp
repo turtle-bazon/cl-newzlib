@@ -35,6 +35,8 @@
                 collect (ldb (byte 64 0) (1- (ash 1 i))))
           '(simple-array (unsigned-byte 64) (64))))
 
+(declaim (type (simple-array (unsigned-byte 64) (64)) +low-bit-masks+))
+
 (declaim (inline grow-buffer))
 (defun grow-buffer (buffer size)
   (let ((new (make-octet-buffer (* 2 size))))
@@ -111,19 +113,26 @@ the system-area pointer BASE."
 
 (declaim (inline write-bits))
 (defun write-bits (writer bits count)
-  "Append the low COUNT bits of BITS to WRITER, LSB-first."
+  "Append the low COUNT bits of BITS to WRITER, LSB-first.  COUNT must be
+at most 16 (the largest count DEFLATE ever emits is a stored block's
+16-bit length); the accumulator invariant keeps NBITS below 8 between
+calls, so the shifted value always fits in 24 bits and no bignum guard is
+needed."
   (declare (optimize (speed 3) (safety 0))
            (type (unsigned-byte 64) bits)
-           (type fixnum count))
-  (setf (bw-accum writer)
-        (definitely-the
-            (unsigned-byte 64)
-          (logior (bw-accum writer)
-                  (ash (logand bits (aref +low-bit-masks+ count))
-                       (bw-nbits writer))))
-        (bw-nbits writer) (+ (bw-nbits writer) count))
-  (when (>= (bw-nbits writer) 8)
-    (flush-pending-bytes writer))
+           (type (integer 0 16) count))
+  (let ((nbits (bw-nbits writer)))
+    (declare (type (unsigned-byte 4) nbits))
+    (setf (bw-accum writer)
+          (definitely-the
+              (unsigned-byte 64)
+            (logior (bw-accum writer)
+                    (ash (definitely-the (unsigned-byte 16)
+                           (ldb (byte count 0) bits))
+                         nbits)))
+          (bw-nbits writer) (+ nbits count))
+    (when (>= (+ nbits count) 8)
+      (flush-pending-bytes writer)))
   nil)
 
 (declaim (inline flush-bits))
@@ -205,7 +214,7 @@ NEWZLIB-END-OF-INPUT when no bytes remain."
   "Return the next COUNT bits of READER without consuming them.  COUNT must
 be <= 48 when bytes remain, else error is signalled on refill."
   (declare (optimize (speed 3) (safety 0))
-           (type fixnum count))
+           (type (unsigned-byte 6) count))
   (loop while (< (br-nbits reader) count) do
     (refill-reader reader))
   (logand (br-accum reader) (aref +low-bit-masks+ count)))
@@ -216,7 +225,7 @@ be <= 48 when bytes remain, else error is signalled on refill."
 of input.  Returns (VALUES VALUE AVAILABLE) where AVAILABLE is the number
 of valid bits in VALUE; VALUE's high bits beyond AVAILABLE are zero."
   (declare (optimize (speed 3) (safety 0))
-           (type fixnum count))
+           (type (unsigned-byte 6) count))
   (let ((nbits (br-nbits reader)))
     (declare (type fixnum nbits))
     (when (< nbits count)
@@ -249,9 +258,10 @@ of valid bits in VALUE; VALUE's high bits beyond AVAILABLE are zero."
 
 (declaim (inline read-bits))
 (defun read-bits (reader count)
-  "Consume and return the next COUNT bits of READER, LSB-first."
+  "Consume and return the next COUNT bits of READER, LSB-first.  COUNT must
+be at most 63."
   (declare (optimize (speed 3) (safety 0))
-           (type fixnum count))
+           (type (unsigned-byte 6) count))
   (loop while (< (br-nbits reader) count) do
     (refill-reader reader))
   (prog1 (logand (br-accum reader) (aref +low-bit-masks+ count))

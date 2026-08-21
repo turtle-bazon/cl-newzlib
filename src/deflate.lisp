@@ -89,6 +89,11 @@
     (otherwise (error 'newzlib-parameter-error
                       :detail (format nil "invalid compression level ~A" level)))))
 
+;;; Return-type proclamations keep the callers' token bookkeeping fully
+;;; unboxed (the multiple values feed straight into fixnum arithmetic).
+(declaim (ftype (function * (values fixnum &optional)) insert-string)
+         (ftype (function * (values fixnum fixnum &optional)) longest-match))
+
 (declaim (inline hash-3))
 (defun hash-3 (input pos)
   "Hash the three bytes at INPUT[POS..POS+2] into HASH-SIZE buckets."
@@ -552,7 +557,7 @@ alignment.  Blocks after the first start at a byte boundary."
   "Emit INPUT[START,END) as stored blocks, splitting at +MAX-STORED-BLOCK+
 bytes per block."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input)
+           (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (if (< start end)
       (loop for s from start below end by +max-stored-block+
@@ -562,7 +567,7 @@ bytes per block."
 
 (defun emit-stored-block (writer input start end bfinal)
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array input)
+           (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (write-bits writer (if bfinal 1 0) 1)
   (write-bits writer 0 2)
@@ -601,7 +606,7 @@ bytes per block."
   "Total coded bits for the token stream, plus the accumulated EXTRA-BITS."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 16) (*)) sym dist)
-           (type simple-array len-array dist-len-array)
+           (type (simple-array fixnum (*)) len-array dist-len-array)
            (type fixnum nsym extra-bits))
   (let ((bits extra-bits))
     (declare (type fixnum bits))
@@ -617,7 +622,7 @@ bytes per block."
 appending to BL-SYM/BL-EXTRA starting at NBL and counting frequencies into
 BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
   (declare (optimize (speed 3) (safety 0))
-           (type simple-array lengths bl-sym bl-extra bl-freq)
+           (type (simple-array fixnum (*)) lengths bl-sym bl-extra bl-freq)
            (type fixnum n nbl))
   (let ((count 0)
         (prevlen -1)
@@ -677,8 +682,8 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
                             hlit hdist hclen)
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
-           (type simple-array lit-codes lit-lengths dist-codes dist-lengths
-                              bl-sym bl-extra bl-codes bl-lengths)
+           (type (simple-array fixnum (*)) lit-codes lit-lengths dist-codes
+                              dist-lengths bl-sym bl-extra bl-codes bl-lengths)
            (type fixnum nsym nbl hlit hdist hclen))
   (write-bits writer (if bfinal 1 0) 1)
   (write-bits writer 2 2)
@@ -729,7 +734,7 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
 (defun deflate-into-writer (input start end writer level)
   "Compress INPUT[START,END) into WRITER as one DEFLATE stream.  Level 0
 emits stored blocks; higher levels pick the cheapest block encoding."
-  (declare (type simple-array input)
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end level))
   (let ((n (- end start)))
     (if (zerop level)

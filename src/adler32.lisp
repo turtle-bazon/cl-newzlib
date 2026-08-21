@@ -19,7 +19,7 @@
 
 (declaim (inline %adler32))
 (defun %adler32 (octets start end s1 s2)
-  (declare (type simple-array octets)
+  (declare (type (simple-array (unsigned-byte 8) (*)) octets)
            (type fixnum start end)
            (type (unsigned-byte 32) s1 s2)
            (optimize (speed 3) (safety 0) (debug 0)))

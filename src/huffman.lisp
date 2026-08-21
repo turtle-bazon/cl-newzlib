@@ -38,6 +38,15 @@
   (make-array 19 :element-type '(unsigned-byte 8)
               :initial-contents '(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15)))
 
+;;; The compiler needs these types to keep the per-match table lookups
+;;; (LENGTH-CODE/DIST-CODE/extras/bases) off the generic array-access and
+;;; boxed-arithmetic paths.
+(declaim (type (simple-array (unsigned-byte 8) (*))
+               +length-extra-bits+ +dist-extra-bits+ +code-length-order+
+               +length-code+ +dist-code+)
+         (type (simple-array (unsigned-byte 16) (*))
+               +length-base+ +dist-base+))
+
 ;;; Map match lengths (3..258) to length codes (0..28), and distances
 ;;; (1..32768) to distance codes (0..29), using zlib's construction.
 (defun compute-length-code-table ()
@@ -129,7 +138,7 @@
 LENGTHS[START,START+N).  ROOT bits are looked up at once through a fast
 jump table; codes longer than ROOT fall back to a canonical walk.  Returns
 a HUFFMAN-DECODE-TABLE."
-  (declare (type simple-array lengths)
+  (declare (type (simple-array fixnum (*)) lengths)
            (type fixnum start n root)
            (optimize (speed 3) (safety 0)))
   (let ((counts (make-array (1+ +max-code-length+) :element-type 'fixnum
@@ -138,7 +147,7 @@ a HUFFMAN-DECODE-TABLE."
                            :initial-element 0))
         (offsets (make-array (1+ +max-code-length+) :element-type 'fixnum
                              :initial-element 0)))
-    (declare (type simple-array counts first offsets))
+    (declare (type (simple-array fixnum (*)) counts first offsets))
     (loop for i from start below (+ start n) do
       (let ((l (aref lengths i)))
         (declare (type fixnum l))
@@ -156,7 +165,7 @@ a HUFFMAN-DECODE-TABLE."
         (error 'newzlib-format-error :detail "invalid Huffman code lengths")))
     (let ((symbols (make-array n :element-type 'fixnum :initial-element 0))
           (max-length 0))
-      (declare (type simple-array symbols))
+      (declare (type (simple-array fixnum (*)) symbols))
       (loop for l from 1 to +max-code-length+
             for k fixnum = (aref offsets l) then k do
         (when (plusp (aref counts l))

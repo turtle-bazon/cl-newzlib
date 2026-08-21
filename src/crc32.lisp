@@ -21,7 +21,7 @@
 (defun crc32-update (crc octets start end)
   "Update CRC32 starting from CRC over OCTETS[START,END)."
   (declare (type (unsigned-byte 32) crc)
-           (type simple-array octets)
+           (type (simple-array (unsigned-byte 8) (*)) octets)
            (type fixnum start end)
            (optimize (speed 3) (safety 0) (debug 0)))
   (let ((table +crc32-table+)
@@ -39,7 +39,7 @@ Portable path: the 32-bit working value is carried in two 16-bit words so
 that no bignum boxing occurs on implementations whose fixnums are only 32
 bits wide (Zach Beane's trick, also used by chipz)."
   (declare (type (unsigned-byte 32) crc)
-           (type simple-array octets)
+           (type (simple-array (unsigned-byte 8) (*)) octets)
            (type fixnum start end)
            (optimize (speed 3) (safety 0)))
   (let* ((table +crc32-table+)

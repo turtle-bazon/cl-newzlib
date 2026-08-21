@@ -161,9 +161,11 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                    ;; overlapping copy: each byte reads the byte DISTANCE
                    ;; back, which this same copy has already written
                    (t
-                    (iterate:iterate
-                      (iterate:for i from pos below (+ pos length))
-                      (setf (aref buffer i) (aref buffer (- i distance))))
+                    (let ((end (+ pos length)))
+                      (declare (type fixnum end))
+                      (loop for i of-type fixnum from pos below end
+                            do (setf (aref buffer i)
+                                     (aref buffer (- i distance)))))
                     (incf pos length))))))))))
   (values buffer pos size))
 ;;; ------------------------------------------------------------------

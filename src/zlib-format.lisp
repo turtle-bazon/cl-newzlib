@@ -31,19 +31,35 @@
 (defun zlib-compress (input &optional (start 0) (end (length input))
                             (level +default-compression+))
   "Compress INPUT[START,END) into the RFC 1950 zlib format (header + DEFLATE
-  data + Adler-32).  Returns a fresh octet vector."
+data + Adler-32).  Returns a fresh octet vector."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end))
   (check-compression-level level)
-  (let* ((header (zlib-header-octets level))
-         (deflated (deflate-raw input start end level))
-         (checksum (adler32 input start end))
-         (out (make-octet-buffer (+ 2 (length deflated) 4))))
-    (replace out header)
-    (replace out deflated :start1 2)
-    (setf (aref out (+ 2 (length deflated))) (ldb (byte 8 24) checksum)
-          (aref out (+ 3 (length deflated))) (ldb (byte 8 16) checksum)
-          (aref out (+ 4 (length deflated))) (ldb (byte 8 8) checksum)
-          (aref out (+ 5 (length deflated))) (ldb (byte 8 0) checksum))
-    out))
+  ;; deflate straight into the pooled writer buffer behind the two header
+  ;; bytes; one final copy produces the exact-size result
+  (let* ((n (- end start))
+         (scratch (acquire-lz77-scratch (1+ n)))
+         (writer (reset-bit-writer (lzs-writer scratch) (+ n (ash n -3) 262))))
+    (unwind-protect
+         (progn
+           (setf (bw-pos writer) 2)
+           (let ((header (zlib-header-octets level))
+                 (buf (bw-buffer writer)))
+             (setf (aref buf 0) (aref header 0)
+                   (aref buf 1) (aref header 1)))
+           (deflate-into-writer input start end writer level)
+           (flush-bits writer)
+           (let* ((pos (bw-pos writer))
+                  (checksum (adler32 input start end))
+                  (out (make-octet-buffer (+ pos 4))))
+             (declare (type fixnum pos))
+             (replace out (bw-buffer writer) :end2 pos)
+             (setf (aref out pos)       (ldb (byte 8 24) checksum)
+                   (aref out (+ pos 1)) (ldb (byte 8 16) checksum)
+                   (aref out (+ pos 2)) (ldb (byte 8 8) checksum)
+                   (aref out (+ pos 3)) (ldb (byte 8 0) checksum))
+             out))
+      (release-lz77-scratch scratch))))
 
 (defun parse-zlib-header (input start end)
   "Validate the zlib header in INPUT[START,END).  Returns the position just

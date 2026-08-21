@@ -191,6 +191,10 @@ START-LEN, bounded by END and +MAX-MATCH+."
                    ;; past the start of the input) ends the walk
                    (let ((delta (logand (- pos res) #xFFFF)))
                      (declare (type fixnum delta))
+                     ;; DELTA = 0 flags a residue aliased from 64K back;
+                     ;; DELTA > POS means a stale link from an earlier input
+                     ;; (PREV is deliberately not cleared) reaching past the
+                     ;; start; both end the walk, as does the window check
                      (when (or (zerop delta) (> delta +max-dist+) (> delta pos))
                        (return))
                      (when (>= chain max-chain) (return))
@@ -299,7 +303,9 @@ occasional wasted comparison."
             (lzs-el s) (make-u16-vector token-size)
             (lzs-ed s) (make-u16-vector token-size)))
     (fill (lzs-head s) #xFFFF)
-    (fill (lzs-prev s) #xFFFF)
+    ;; PREV is left stale on purpose: real chains terminate inside the
+    ;; current input's entries before reaching stale links in most cases,
+    ;; and stale links are always byte-verified like real ones.
     s))
 
 (defun release-lz77-scratch (s)
@@ -328,11 +334,10 @@ occasional wasted comparison."
 ;;; where every referenced name is bound.
 
 (defmacro %emit-literal (p)
+  ;; DIST/EL/ED are only read back for symbols > 256, so literals need not
+  ;; store zeros into them (the arrays hold stale pool data there).
   `(let ((b (aref input ,p)))
-     (setf (aref sym nsym) b
-           (aref dist nsym) 0
-           (aref el nsym) 0
-           (aref ed nsym) 0)
+     (setf (aref sym nsym) b)
      (incf (aref lit-freq b))
      (incf nsym)))
 
@@ -617,6 +622,30 @@ bytes per block."
           (incf bits (aref dist-len-array (aref dist i))))))
     bits))
 
+(defun data-bits/dynamic-and-fixed (sym dist nsym dyn-lens fixed-lens
+                                     dist-dyn-lens dist-fixed-lens extra-bits)
+  "Like DATA-BITS twice: returns (VALUES DYN-BITS FIXED-BITS) computing both
+size estimates in a single pass over the tokens."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 16) (*)) sym dist)
+           (type (simple-array fixnum (*)) dyn-lens fixed-lens
+                 dist-dyn-lens dist-fixed-lens)
+           (type fixnum nsym extra-bits))
+  (let ((dyn extra-bits)
+        (fixed extra-bits))
+    (declare (type fixnum dyn fixed))
+    (loop for i below nsym do
+      (let ((s (aref sym i)))
+        (declare (type fixnum s))
+        (incf dyn (aref dyn-lens s))
+        (incf fixed (aref fixed-lens s))
+        (when (> s 256)
+          (let ((d (aref dist i)))
+            (declare (type fixnum d))
+            (incf dyn (aref dist-dyn-lens d))
+            (incf fixed (aref dist-fixed-lens d))))))
+    (values dyn fixed)))
+
 (defun scan-code-lengths (lengths n bl-sym bl-extra bl-freq nbl)
   "RLE-encode LENGTHS[0..N) into code-length symbols (RFC 1951 3.2.7),
 appending to BL-SYM/BL-EXTRA starting at NBL and counting frequencies into
@@ -818,17 +847,15 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                                             (aref bl-lengths
                                                   (aref (lzs-bl-sym scratch) i))))
                                    (ensure-static-trees)
-                                   (let ((opt-size (+ 3 14 (* 3 hclen) bl-extra2 bl-code-bits
-                                                      (data-bits (lzs-sym scratch)
-                                                                 (lzs-distc scratch)
-                                                                 nsym lit-lengths
-                                                                 dist-lengths extra-bits)))
-                                         (fixed-size (+ 3 (data-bits (lzs-sym scratch)
-                                                                     (lzs-distc scratch)
-                                                                     nsym
-                                                                     +static-lit-lengths+
-                                                                     +static-dist-lengths+
-                                                                     extra-bits)))
+                                   (multiple-value-bind (dyn-bits fixed-bits)
+                                       (data-bits/dynamic-and-fixed
+                                        (lzs-sym scratch) (lzs-distc scratch) nsym
+                                        lit-lengths +static-lit-lengths+
+                                        dist-lengths +static-dist-lengths+
+                                        extra-bits)
+                                     (declare (ignorable dyn-bits fixed-bits))
+                                     (let ((opt-size (+ 3 14 (* 3 hclen) bl-extra2 bl-code-bits dyn-bits))
+                                         (fixed-size (+ 3 fixed-bits))
                                          (stored-size (stored-block-bits writer n)))
                                      (cond
                                        ((<= stored-size (min opt-size fixed-size))
@@ -848,7 +875,7 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                                                             (lzs-bl-sym scratch)
                                                             (lzs-bl-extra scratch)
                                                             bl-codes bl-lengths
-                                                            nbl2 hlit hdist hclen)))))))))))))))
+                                                            nbl2 hlit hdist hclen))))))))))))))))
             (release-lz77-scratch scratch))))))
 
 (defun deflate-raw (input &optional (start 0) (end (length input)) (level 6))

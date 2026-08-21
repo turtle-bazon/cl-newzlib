@@ -22,15 +22,21 @@
 (defparameter +fixed-dist-lengths+
   (make-array 30 :element-type 'fixnum :initial-element 5))
 
-(defparameter +fixed-lit-table+ nil)
-(defparameter +fixed-dist-table+ nil)
+;;; The fixed decode tables are built eagerly at load time.  A previous
+;;; lazy check-then-act initialization was a data race: the two SETFs are
+;;; not atomic together, so a thread entering between them observed a built
+;;; literal table alongside a NIL distance table and -- with the hot paths
+;;; compiled at safety 0 -- faulted on the NIL.  Eager construction makes
+;;; the race impossible by construction.
+(defparameter +fixed-lit-table+
+  (build-huffman-decode-table +fixed-lit-lengths+))
+(defparameter +fixed-dist-table+
+  (build-huffman-decode-table +fixed-dist-lengths+))
 
-(declaim (type (or null huffman-decode-table) +fixed-lit-table+ +fixed-dist-table+))
+(declaim (type huffman-decode-table +fixed-lit-table+ +fixed-dist-table+))
 
 (defun ensure-fixed-tables ()
-  (unless +fixed-lit-table+
-    (setf +fixed-lit-table+ (build-huffman-decode-table +fixed-lit-lengths+)
-          +fixed-dist-table+ (build-huffman-decode-table +fixed-dist-lengths+)))
+  "Return the fixed Huffman decode tables (built at load time)."
   (values +fixed-lit-table+ +fixed-dist-table+))
 
 ;;; ------------------------------------------------------------------

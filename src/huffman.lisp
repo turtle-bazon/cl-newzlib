@@ -276,27 +276,30 @@ can be emitted directly with the LSB-first writer."
       (setf res (logior (ash res 1) (logand code 1))
             code (ash code -1)))))
 
-(defparameter +static-lit-codes+ nil)
-(defparameter +static-lit-lengths+ nil)
-(defparameter +static-dist-codes+ nil)
-(defparameter +static-dist-lengths+ nil)
+;;; The static trees are built eagerly at load time.  Lazy check-then-act
+;;; initialization of these four globals was a data race under concurrent
+;;; compression (several sequential SETFs; a reader between them observed a
+;;; half-initialized tree).  Eager construction makes the race impossible.
+(multiple-value-bind (codes lengths)
+    (compute-static-lit-tree)
+  (defparameter +static-lit-codes+ codes)
+  (defparameter +static-lit-lengths+ lengths))
 
-(declaim (type (or null (simple-array fixnum (*)))
+(defparameter +static-dist-codes+
+  (let ((codes (make-array 30 :element-type 'fixnum)))
+    (dotimes (n 30)
+      (setf (aref codes n) (reverse-bits n 5)))
+    codes))
+
+(defparameter +static-dist-lengths+
+  (make-array 30 :element-type 'fixnum :initial-element 5))
+
+(declaim (type (simple-array fixnum (*))
                +static-lit-codes+ +static-lit-lengths+
                +static-dist-codes+ +static-dist-lengths+))
 
 (defun ensure-static-trees ()
-  (unless +static-lit-codes+
-    (multiple-value-bind (codes lengths)
-        (compute-static-lit-tree)
-      (setf +static-lit-codes+ codes
-            +static-lit-lengths+ lengths))
-    (let ((codes (make-array 30 :element-type 'fixnum))
-          (lengths (make-array 30 :element-type 'fixnum :initial-element 5)))
-      (dotimes (n 30)
-        (setf (aref codes n) (reverse-bits n 5)))
-      (setf +static-dist-codes+ codes
-            +static-dist-lengths+ lengths)))
+  "Return the static Huffman trees (built at load time)."
   (values +static-lit-codes+ +static-lit-lengths+
           +static-dist-codes+ +static-dist-lengths+))
 

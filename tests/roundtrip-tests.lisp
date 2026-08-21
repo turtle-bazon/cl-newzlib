@@ -231,3 +231,50 @@
                               (decompress s :format :gzip)))))
       (when (probe-file in-file) (delete-file in-file))
       (when (probe-file gz-file) (delete-file gz-file)))))
+
+;;; ------------------------------------------------------------------
+;;; Regression: unsynchronized lazy initialization of the fixed Huffman
+;;; tables and static trees was a data race (a thread entering between the
+;;; two SETFs of ENSURE-FIXED-TABLES received a NIL distance table and, at
+;;; safety 0, faulted).  Both are now built eagerly at load time.
+;;; ------------------------------------------------------------------
+
+(test fixed-tables-eagerly-built
+  "The fixed decode tables and static trees must exist immediately after
+load -- no lazy initialization left to race."
+  (is (not (null cl-newzlib::+fixed-lit-table+)))
+  (is (not (null cl-newzlib::+fixed-dist-table+)))
+  (is (not (null cl-newzlib::+static-lit-codes+)))
+  (is (not (null cl-newzlib::+static-lit-lengths+)))
+  (is (not (null cl-newzlib::+static-dist-codes+)))
+  (is (not (null cl-newzlib::+static-dist-lengths+))))
+
+#+sb-thread
+(test concurrent-inflate-stress
+  "Eight threads inflating fixed-Huffman and mixed streams concurrently.
+Reproduces the conditions of the lazy-init race (which is now impossible
+by construction); also shakes out any other inflate state sharing."
+  (let* ((data (random-octets 2048))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         ;; an empty stream always emits a fixed-Huffman block; small
+         ;; level-1 streams mix fixed/dynamic/stored blocks
+         (jobs (append (make-list 64 :initial-element
+                                     (cons (raw-deflate empty 0 0 1) empty))
+                       (loop for i below 128
+                             for len = (* 4 (1+ (mod i 512)))
+                             collect (cons (raw-deflate data 0 len 1)
+                                           (subseq data 0 len)))))
+         (n (length jobs))
+         (failures '())
+         (lock (sb-thread:make-mutex :name "inflate-stress"))
+         (threads (loop for w below 8
+                        collect (sb-thread:make-thread
+                                 (lambda ()
+                                   (loop for j from w below n by 8
+                                         do (destructuring-bind (c . orig)
+                                                (nth j jobs)
+                                              (unless (equalp (raw-inflate c) orig)
+                                                (sb-thread:with-mutex (lock)
+                                                  (push j failures))))))))))
+    (dolist (th threads) (sb-thread:join-thread th))
+    (is (null failures))))

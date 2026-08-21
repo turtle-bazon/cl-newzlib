@@ -233,14 +233,34 @@ accesses are GC-safe without pinning)."
 
 (defparameter *scratch-pool-max* 4)
 (defvar *scratch-pool* '())
+
+;;; Pool access must be serialized on any implementation that can run
+;;; multiple threads; truly single-threaded images skip the lock.  An
+;;; implementation not listed here that nonetheless supports threads would
+;;; need its lock added below (until then it falls into the unlocked case,
+;;; which is only safe for single-threaded use).
 #+sb-thread
 (defvar *scratch-lock* (sb-thread:make-mutex :name "cl-newzlib scratch pool"))
-#-sb-thread
-(defparameter *scratch-lock* nil)
+#+ccl
+(defvar *scratch-lock* (ccl:make-lock "cl-newzlib scratch pool"))
+#+lispworks
+(defvar *scratch-lock* (mp:make-lock :name "cl-newzlib scratch pool"))
+#+abcl
+(defvar *scratch-lock* (threads:make-thread-lock "cl-newzlib scratch pool"))
+#+(and ecl threads)
+(defvar *scratch-lock* (mp:make-lock :name "cl-newzlib scratch pool"))
+#+(and clasp threads)
+(defvar *scratch-lock* (mp:make-lock :name "cl-newzlib scratch pool"))
 
 (defmacro with-scratch-lock (&body body)
   #+sb-thread `(sb-thread:with-mutex (*scratch-lock*) ,@body)
-  #-sb-thread `(locally ,@body))
+  #+ccl `(ccl:with-lock-grabbed (*scratch-lock*) ,@body)
+  #+lispworks `(mp:with-lock (*scratch-lock*) ,@body)
+  #+abcl `(threads:with-thread-lock (*scratch-lock*) ,@body)
+  #+(and ecl threads) `(mp:with-lock (*scratch-lock*) ,@body)
+  #+(and clasp threads) `(mp:with-lock (*scratch-lock*) ,@body)
+  #-(or sb-thread ccl lispworks abcl (and ecl threads) (and clasp threads))
+  `(progn ,@body))
 
 (defun make-u16-vector (n)
   (make-array n :element-type '(unsigned-byte 16)))

@@ -298,35 +298,73 @@ can be emitted directly with the LSB-first writer."
 
 (defconstant +heap-size+ (1+ (* 2 +l-codes+)))
 
-(defun build-huffman-codes (freq elems max-length)
+;;; Reusable scratch for BUILD-HUFFMAN-CODES.  The compressor calls the
+;;; builder three times per block; handing it preallocated arrays keeps the
+;;; hot path free of large allocations.
+(defstruct (huff-work
+            (:conc-name hw-)
+            (:constructor make-huff-work))
+  (heap nil :type (simple-array fixnum (*)))
+  (dad nil :type (simple-array fixnum (*)))
+  (depth nil :type (simple-array fixnum (*)))
+  (node-length nil :type (simple-array fixnum (*)))
+  (bl-count nil :type (simple-array fixnum (*)))
+  (next nil :type (simple-array fixnum (*))))
+;;; already-typed; the builder's LOCAL declarations below are what matter
+
+(defun make-standard-huff-work ()
+  (make-huff-work
+   :heap (make-array +heap-size+ :element-type 'fixnum)
+   :dad (make-array +heap-size+ :element-type 'fixnum)
+   :depth (make-array +heap-size+ :element-type 'fixnum)
+   :node-length (make-array +heap-size+ :element-type 'fixnum)
+   :bl-count (make-array (1+ +max-code-length+) :element-type 'fixnum
+                         :initial-element 0)
+   :next (make-array (1+ +max-code-length+) :element-type 'fixnum
+                     :initial-element 0)))
+
+(defun build-huffman-codes (freq elems max-length &optional
+                                        work out-lengths out-codes)
   "Given FREQ (a vector of symbol frequencies, length >= +HEAP-SIZE+, entries
 >= ELEMS used as scratch for internal nodes), compute a length-limited
 canonical Huffman code.  Returns (VALUES LENGTHS CODES MAX-CODE) where
 LENGTHS[i] is the code length (0 for unused), CODES[i] is the bit-reversed
 canonical code value (0 for unused), and MAX-CODE is the largest symbol
-index with a non-zero frequency."
-  (declare (type simple-array freq)
+index with a non-zero frequency.  WORK/OUT-LENGTHS/OUT-CODES, when given,
+are reused scratch and result arrays (OUT-LENGTHS/OUT-CODES must have at
+least ELEMS entries); otherwise fresh arrays are allocated."
+  (declare (type (simple-array fixnum (*)) freq)
            (type fixnum elems max-length)
            (optimize (speed 3) (safety 0)))
-  (let* ((heap (make-array +heap-size+ :element-type 'fixnum))
-         (dad (make-array +heap-size+ :element-type 'fixnum))
-         (depth (make-array +heap-size+ :element-type 'fixnum))
-         (node-length (make-array +heap-size+ :element-type 'fixnum))
-         (leaf-lengths (make-array elems :element-type 'fixnum))
-         (codes (make-array elems :element-type 'fixnum))
-         (bl-count (make-array (1+ +max-code-length+) :element-type 'fixnum
-                               :initial-element 0))
+  (let* ((work (or work (make-standard-huff-work)))
+         (heap (hw-heap work))
+         (dad (hw-dad work))
+         (depth (hw-depth work))
+         (node-length (hw-node-length work))
+         (leaf-lengths (or out-lengths
+                           (make-array elems :element-type 'fixnum)))
+         (codes (or out-codes
+                    (make-array elems :element-type 'fixnum)))
+         (bl-count (hw-bl-count work))
+         (next (hw-next work))
          (heap-len 0)
          (heap-max +heap-size+)
          (max-code -1)
          (overflow 0))
-    (declare (type fixnum heap-len heap-max max-code overflow))
+    (declare (type (simple-array fixnum (*)) heap dad depth node-length
+                    leaf-lengths codes bl-count next)
+             (type fixnum heap-len heap-max max-code overflow))
+    (fill bl-count 0)
+    (fill next 0)
     (labels ((smaller (n m)
+               (declare (type fixnum n m))
                (let ((fn (aref freq n))
                      (fm (aref freq m)))
+                 (declare (type fixnum fn fm))
                  (or (< fn fm)
                      (and (= fn fm) (<= (aref depth n) (aref depth m))))))
              (pqdownheap (k)
+               (declare (type fixnum k))
                (let ((v (aref heap k)))
                  (declare (type fixnum v))
                  (loop for j = (ash k 1) then (ash j 1) do
@@ -414,13 +452,14 @@ index with a non-zero frequency."
                   (when (<= m max-code)
                     (setf (aref node-length m) bits)
                     (decf n))))))))
-      ;; copy leaf lengths out
+      ;; copy leaf lengths out.  Only symbols that entered the heap (i.e.
+      ;; have non-zero frequency -- FREQ is unmodified below ELEMS) have a
+      ;; meaningful NODE-LENGTH; unused symbols must stay at length 0.
       (loop for n from 0 below elems do
-        (setf (aref leaf-lengths n) (aref node-length n)))
+        (when (plusp (aref freq n))
+          (setf (aref leaf-lengths n) (aref node-length n))))
       ;; gen_codes: assign canonical codes, bit-reversed for LSB-first output
-      (let ((next (make-array (1+ +max-code-length+) :element-type 'fixnum
-                              :initial-element 0))
-            (code 0))
+      (let ((code 0))
         (declare (type fixnum code))
         (loop for bits from 1 to +max-code-length+ do
           (setf code (ash (+ code (aref bl-count (1- bits))) 1))

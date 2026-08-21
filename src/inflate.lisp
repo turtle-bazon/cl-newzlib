@@ -146,20 +146,25 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                  (ensure-out-capacity buffer size pos length)
                (setf buffer nbuffer
                      size nsize)
-                (if (<= length distance)
-                    ;; non-overlapping copy
-                    (progn
-                      (replace buffer buffer
-                               :start1 pos :start2 src
-                               :end1 (+ pos length) :end2 (+ src length))
-                      (incf pos length))
-                    ;; overlapping copy: each byte reads the byte DISTANCE
-                    ;; back, which this same copy has already written
-                    (progn
-                      (iterate:iterate
-                        (iterate:for i from pos below (+ pos length))
-                        (setf (aref buffer i) (aref buffer (- i distance))))
-                      (incf pos length))))))))))
+                 (cond
+                   ;; run-length copy: every byte repeats the one before
+                   ((= distance 1)
+                    (let ((b (aref buffer (1- pos))))
+                      (fill buffer b :start pos :end (+ pos length)))
+                    (incf pos length))
+                   ;; non-overlapping copy
+                   ((<= length distance)
+                    (replace buffer buffer
+                             :start1 pos :start2 src
+                             :end1 (+ pos length) :end2 (+ src length))
+                    (incf pos length))
+                   ;; overlapping copy: each byte reads the byte DISTANCE
+                   ;; back, which this same copy has already written
+                   (t
+                    (iterate:iterate
+                      (iterate:for i from pos below (+ pos length))
+                      (setf (aref buffer i) (aref buffer (- i distance))))
+                    (incf pos length))))))))))
   (values buffer pos size))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header

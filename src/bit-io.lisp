@@ -50,6 +50,24 @@
             (bw-size writer) (* 2 (bw-size writer)))))
   nil)
 
+;;; Little-endian machines can move whole words between the accumulator and
+;;; the output buffer; DEFLATE's LSB-first packing is exactly little-endian
+;;; byte order, so a native 32-bit store is equivalent to four byte stores.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  #+sbcl (when (eq sb-c:*backend-byte-order* :little-endian)
+           (pushnew :cl-newzlib-le *features*)))
+
+#+(and sbcl cl-newzlib-le)
+(progn
+  (declaim (inline %word-at))
+  (defun %word-at (base i)
+    "Load the native (little-endian) 32-bit word at byte offset I through
+the system-area pointer BASE."
+    (declare (optimize (speed 3) (safety 0))
+             (type sb-sys:system-area-pointer base)
+             (type fixnum i))
+    (sb-sys:sap-ref-32 base i)))
+
 (declaim (inline flush-pending-bytes))
 (defun flush-pending-bytes (writer)
   "Flush as many whole bytes as possible from the accumulator into the buffer."
@@ -57,21 +75,38 @@
   (let ((accum (bw-accum writer))
         (nbits (bw-nbits writer))
         (pos (bw-pos writer))
-        (buffer (bw-buffer writer)))
+        (buffer (bw-buffer writer))
+        (size (bw-size writer)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits pos))
-    (loop while (>= nbits 8) do
-      (when (>= pos (bw-size writer))
-        (setf buffer (grow-buffer buffer (bw-size writer)))
-        (setf (bw-buffer writer) buffer)
-        (setf (bw-size writer) (* 2 (bw-size writer))))
-      (setf (aref buffer pos) (logand accum #xFF))
-      (setf accum (ash accum -8)
-            nbits (- nbits 8)
-            pos (1+ pos)))
+             (type fixnum nbits pos size)
+             (type (simple-array (unsigned-byte 8) (*)) buffer))
+    (macrolet ((grow ()
+                 '(let ((bigger (make-octet-buffer (* 2 size))))
+                    (replace bigger buffer :end2 size)
+                    (setq buffer bigger
+                          size (* 2 size)))))
+      #+(and sbcl cl-newzlib-le)
+      (progn
+        (loop while (>= nbits 32) do
+          (when (> (+ pos 4) size) (grow))
+          ;; no allocation happens between taking the SAP and the store, so
+          ;; the vector cannot move out from under it even without pinning
+          (setf (sb-sys:sap-ref-32 (sb-sys:vector-sap buffer) pos)
+                (ldb (byte 32 0) accum))
+          (setf accum (ash accum -32)
+                nbits (- nbits 32)
+                pos (+ pos 4))))
+      (loop while (>= nbits 8) do
+        (when (>= pos size) (grow))
+        (setf (aref buffer pos) (logand accum #xFF))
+        (setf accum (ash accum -8)
+              nbits (- nbits 8)
+              pos (1+ pos))))
     (setf (bw-accum writer) accum
           (bw-nbits writer) nbits
-          (bw-pos writer) pos))
+          (bw-pos writer) pos
+          (bw-buffer writer) buffer
+          (bw-size writer) size))
   nil)
 
 (declaim (inline write-bits))
@@ -142,12 +177,27 @@ NEWZLIB-END-OF-INPUT when no bytes remain."
              (type (simple-array (unsigned-byte 8) (*)) buffer))
     (when (>= pos end)
       (error 'newzlib-end-of-input))
-    (setf (br-accum reader)
-          (definitely-the
-              (unsigned-byte 64)
-            (logior accum (ash (aref buffer pos) nbits)))
-          (br-pos reader) (1+ pos)
-          (br-nbits reader) (+ nbits 8)))
+    ;; little-endian fast path: pull a whole word when it fits safely
+    #+(and sbcl cl-newzlib-le)
+    ;; no allocation occurs inside this loop, so the SAP stays valid even
+    ;; though BUFFER is not pinned
+    (loop while (and (<= nbits 24) (<= (+ pos 4) end))
+          do (setf accum (logior accum
+                                 (definitely-the (unsigned-byte 64)
+                                   (ash (%word-at (sb-sys:vector-sap buffer)
+                                                  pos)
+                                        nbits)))
+                 nbits (+ nbits 32)
+                 pos (+ pos 4)))
+    (when (< pos end)
+      (setf accum (logior accum
+                          (definitely-the (unsigned-byte 64)
+                            (ash (aref buffer pos) nbits)))
+            nbits (+ nbits 8)
+            pos (1+ pos)))
+    (setf (br-accum reader) accum
+          (br-pos reader) pos
+          (br-nbits reader) nbits))
   nil)
 
 (declaim (inline peek-bits))
@@ -163,8 +213,8 @@ be <= 48 when bytes remain, else error is signalled on refill."
 (declaim (inline peek-bits-capped))
 (defun peek-bits-capped (reader count)
   "Peek up to COUNT bits, refilling as possible without signalling on end
-  of input.  Returns (VALUES VALUE AVAILABLE) where AVAILABLE is the number
-  of valid bits in VALUE; VALUE's high bits beyond AVAILABLE are zero."
+of input.  Returns (VALUES VALUE AVAILABLE) where AVAILABLE is the number
+of valid bits in VALUE; VALUE's high bits beyond AVAILABLE are zero."
   (declare (optimize (speed 3) (safety 0))
            (type fixnum count))
   (let ((nbits (br-nbits reader)))
@@ -177,13 +227,21 @@ be <= 48 when bytes remain, else error is signalled on refill."
         (declare (type fixnum pos end)
                  (type (unsigned-byte 64) accum)
                  (type (simple-array (unsigned-byte 8) (*)) buffer))
-        (loop while (and (< nbits count) (< pos end)) do
-          (setf accum (logior accum
-                              (definitely-the
-                                  (unsigned-byte 64)
-                                (ash (aref buffer pos) nbits)))
-                nbits (+ nbits 8)
-                pos (1+ pos)))
+        #+(and sbcl cl-newzlib-le)
+        (loop while (and (< nbits 17) (<= (+ pos 4) end))
+              do (setf accum (logior accum
+                                     (definitely-the (unsigned-byte 64)
+                                       (ash (%word-at (sb-sys:vector-sap buffer)
+                                                      pos)
+                                            nbits)))
+                     nbits (+ nbits 32)
+                     pos (+ pos 4)))
+        (loop while (and (< nbits count) (< pos end))
+              do (setf accum (logior accum
+                                     (definitely-the (unsigned-byte 64)
+                                       (ash (aref buffer pos) nbits)))
+                     nbits (+ nbits 8)
+                     pos (1+ pos)))
         (setf (br-accum reader) accum
               (br-pos reader) pos
               (br-nbits reader) nbits)))

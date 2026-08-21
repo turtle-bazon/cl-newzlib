@@ -133,7 +133,7 @@
   (index-root 0 :read-only t :type fixnum))
 
 (defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
-                                             (root 9))
+                                             (root 10))
   "Build a canonical Huffman decode table from the code lengths in
 LENGTHS[START,START+N).  ROOT bits are looked up at once through a fast
 jump table; codes longer than ROOT fall back to a canonical walk.  Returns

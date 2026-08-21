@@ -1,5 +1,16 @@
 (in-package #:cl-newzlib)
 
+;;; Optional SIMD support (SBCL on x86-64): load the bundled sb-simd contrib
+;;; up front so later files can compile against it and gate code on the
+;;; :newzlib-simd feature.  Everything must still work without it -- other
+;;; Lisps, other architectures and SBCL builds missing the contrib all fall
+;;; back to portable scalar code.
+#+(and sbcl x86-64)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (handler-case (require :sb-simd) (error () nil))
+  (when (find-package :sb-simd-avx2)
+    (pushnew :newzlib-simd *features*)))
+
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))
 

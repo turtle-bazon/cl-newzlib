@@ -8,15 +8,10 @@
 ;;;   * x86-64 CPUs without AVX2 take the SSE2 path (baseline on x86-64),
 ;;;     selected at image startup by sb-simd's INSTRUCTION-SET-CASE.
 ;;;
+;;; The feature gate :newzlib-simd is pushed in util.lisp (loaded earlier).
 ;;; The vector loads go through sb-simd's AREF interface, which re-derives
 ;;; the data vector on every access and is therefore GC-safe without any
 ;;; manual pinning.
-
-#+(and sbcl x86-64)
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (handler-case (require :sb-simd) (error () nil))
-  (when (find-package :sb-simd-avx2)
-    (pushnew :newzlib-simd *features*)))
 
 ;;; ------------------------------------------------------------------
 ;;; Leading-equal-octets: how many bytes of INPUT[A..] and INPUT[B..]

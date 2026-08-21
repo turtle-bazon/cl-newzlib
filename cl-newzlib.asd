@@ -18,6 +18,7 @@ fast paths, aiming to compete with the C zlib implementation."
                              (:file "crc32")
                              (:file "bit-io")
                              (:file "huffman")
+                             (:file "simd")
                              (:file "deflate")
                              (:file "inflate")
                              (:file "zlib-format")

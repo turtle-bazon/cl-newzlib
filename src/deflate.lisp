@@ -122,53 +122,33 @@ match_head)."
             (aref head h) res)
       old)))
 
-(defun longest-match (input base pos end first-res head prev max-chain nice good best-len)
+(defun longest-match (input pos end first-res head prev max-chain nice good best-len)
   "Find the longest match for the string starting at INPUT[POS], ignoring
 matches no longer than BEST-LEN (zlib seeds this with the pending lazy match
 length).  FIRST-RES is the first chain entry as a 16-bit position residue
 (the hash head captured before POS was inserted, so it never equals POS).
-BASE is the raw SAP of INPUT on SBCL (pinned by the caller); elsewhere it is
-ignored and ordinary array accesses are used.  Returns (VALUES LENGTH
-DISTANCE).  Overlapping matches are allowed (the byte being matched at
-POS+LEN is the byte DISTANCE positions back), so runs longer than the
-distance are handled."
+Returns (VALUES LENGTH DISTANCE).  Overlapping matches are allowed (the byte
+being matched at POS+LEN is the byte DISTANCE positions back), so runs
+longer than the distance are handled."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array (unsigned-byte 16) (*)) head prev)
            (type fixnum pos end first-res max-chain nice good best-len))
-  #+sbcl
-  (declare (type sb-sys:system-area-pointer base))
-  #-sbcl
-  (declare (ignore base))
   (labels ((extend-match (cand start-len)
              "Longest run INPUT[POS+LEN..] == INPUT[CAND+LEN..] starting at
-START-LEN, bounded by END and +MAX-MATCH+."
+START-LEN, bounded by END and +MAX-MATCH+.  The bulk comparison goes
+through LEADING-EQUAL-OCTETS (SIMD-accelerated where available; its array
+accesses are GC-safe without pinning)."
              (declare (type fixnum cand start-len))
-             #+sbcl
-             (let ((len start-len))
-               (declare (type fixnum len))
-               ;; compare four bytes at a time; INPUT is pinned by RUN-LZ77
-               ;; for the whole search and the unaligned reads stay inside END
-               (loop while (and (< (+ pos 4 len) end)
-                                (< len +max-match+)
-                                (= (sb-sys:sap-ref-32 base (+ pos len))
-                                   (sb-sys:sap-ref-32 base (+ cand len))))
-                     do (incf len 4))
-               (loop while (and (< (+ pos len) end)
-                                (< len +max-match+)
-                                (= (aref input (+ pos len))
-                                   (aref input (+ cand len))))
-                     do (incf len))
-               len)
-             #-sbcl
-             (let ((len start-len))
-               (declare (type fixnum len))
-               (loop while (and (< (+ pos len) end)
-                                (< len +max-match+)
-                                (= (aref input (+ pos len))
-                                   (aref input (+ cand len))))
-                     do (incf len))
-               len))
+             (let ((limit (min (- end pos) +max-match+)))
+               (declare (type fixnum limit))
+               (if (< start-len limit)
+                   (+ start-len
+                      (leading-equal-octets input
+                                            (+ pos start-len)
+                                            (+ cand start-len)
+                                            (- limit start-len)))
+                   start-len)))
            (walk ()
              (let ((best-dist 0)
                    (chain 0)
@@ -373,21 +353,14 @@ occasional wasted comparison."
               (setf (aref prev (logand q +window-mask+)) (aref head h)
                     (aref head h) qres)))))
 
-(defun %lz77-search (input base start end nice good max-chain max-lazy lazy-p
+(defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
                      sym dist el ed head prev lit-freq dist-freq)
-  "LZ77 tokenization core; see RUN-LZ77.  BASE is INPUT's SAP on SBCL
-(where INPUT is pinned for the duration), ignored elsewhere.  Returns
-(VALUES NSYM EXTRA-BITS)."
+  "LZ77 tokenization core; see RUN-LZ77.  Returns (VALUES NSYM EXTRA-BITS)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array (unsigned-byte 16) (*)) sym dist el ed head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end nice good max-chain max-lazy))
-  #+sbcl
-  (declare (type sb-sys:system-area-pointer base))
-  #-sbcl
-  (declare (type null base)
-           (ignore base))
   (let ((nsym 0)
         (extra-bits 0)
         (pos start))
@@ -424,7 +397,7 @@ occasional wasted comparison."
                                  (or (not have-pending)
                                      (< pending-len max-lazy)))
                         (multiple-value-bind (len d)
-                            (longest-match input base pos end cand head prev
+                            (longest-match input pos end cand head prev
                                            max-chain nice good
                                            (if have-pending
                                                pending-len
@@ -474,7 +447,7 @@ occasional wasted comparison."
                         (%emit-literal pos)
                         (incf pos))
                       (multiple-value-bind (len d)
-                          (longest-match input base pos end cand head prev
+                          (longest-match input pos end cand head prev
                                          max-chain nice good (1- +min-match+))
                         (if (>= len +min-match+)
                             (progn
@@ -505,19 +478,8 @@ position and only adopts it if no longer match starts on the next byte."
            (type (simple-array (unsigned-byte 16) (*)) sym dist el ed head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end level))
-  ;; the raw SAP of INPUT is only valid while INPUT cannot move, so pin it
-  ;; once for the entire search instead of per candidate comparison
-  #+sbcl
-  (sb-sys:with-pinned-objects (input)
-    (multiple-value-bind (nsym extra-bits)
-        (%lz77-search input (sb-sys:vector-sap input) start end
-                      (nice-length level) (good-length level)
-                      (chain-limit level) (lazy-length level) (> level 3)
-                      sym dist el ed head prev lit-freq dist-freq)
-      (values (finish-token-stream sym el ed lit-freq nsym) extra-bits)))
-  #-sbcl
   (multiple-value-bind (nsym extra-bits)
-      (%lz77-search input nil start end
+      (%lz77-search input start end
                     (nice-length level) (good-length level)
                     (chain-limit level) (lazy-length level) (> level 3)
                     sym dist el ed head prev lit-freq dist-freq)
@@ -579,9 +541,23 @@ bytes per block."
   (align-writer writer)
   (let ((len (- end start)))
     (write-bits writer len 16)
-    (write-bits writer (logand (lognot len) #xFFFF) 16))
-  (loop for i from start below end do
-    (write-bits writer (aref input i) 8)))
+    (write-bits writer (logand (lognot len) #xFFFF) 16)
+    ;; after the 3 header bits (padded to a byte) and the two length words
+    ;; the accumulator is byte-aligned again, so the payload can be copied
+    ;; straight into the output buffer instead of going through WRITE-BITS
+    (let ((buf (bw-buffer writer))
+          (size (bw-size writer))
+          (pos (bw-pos writer)))
+      (declare (type fixnum size pos))
+      (when (> (+ pos len) size)
+        (let ((bigger (make-octet-buffer (* 4 (+ pos len)))))
+          (replace bigger buf :end2 pos)
+          (setf buf bigger
+                size (length bigger))
+          (setf (bw-buffer writer) buf
+                (bw-size writer) size)))
+      (replace buf input :start1 pos :start2 start :end1 (+ pos len) :end2 end)
+      (setf (bw-pos writer) (+ pos len)))))
 
 (defun emit-fixed-block (writer sym dist el ed nsym bfinal)
   (declare (optimize (speed 3) (safety 0))

@@ -168,14 +168,26 @@ decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS)."
                              :start1 pos :start2 src
                              :end1 (+ pos length) :end2 (+ src length))
                     (incf pos length))
-                   ;; overlapping copy: each byte reads the byte DISTANCE
-                   ;; back, which this same copy has already written
+                   ;; overlapping copy: seed the DISTANCE-byte pattern once,
+                   ;; then double the copied span each step.  Every REPLACE
+                   ;; reads a region that ends before its destination
+                   ;; begins, so plain forward copying is safe, and an
+                   ;; O(LENGTH) scalar loop becomes O(LOG) vector copies.
                    (t
-                    (let ((end (+ pos length)))
-                      (declare (type fixnum end))
-                      (loop for i of-type fixnum from pos below end
-                            do (setf (aref buffer i)
-                                     (aref buffer (- i distance)))))
+                    (let ((done distance))
+                      (declare (type fixnum done))
+                      (replace buffer buffer
+                               :start1 pos :start2 src
+                               :end1 (+ pos done) :end2 (+ src done))
+                      (loop while (< done length)
+                            do (let ((chunk (min done (- length done))))
+                                 (declare (type fixnum chunk))
+                                 (replace buffer buffer
+                                          :start1 (+ pos done)
+                                          :start2 pos
+                                          :end1 (+ pos done chunk)
+                                          :end2 (+ pos chunk))
+                                 (incf done chunk))))
                     (incf pos length))))))))))
   (values buffer pos size))
 ;;; ------------------------------------------------------------------

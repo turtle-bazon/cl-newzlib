@@ -21,7 +21,14 @@
   (size 0 :type fixnum)             ; capacity of buffer
   (pos 0 :type fixnum)              ; number of bytes committed
   (accum 0 :type (unsigned-byte 64)); pending bits, low NBITS significant
-  (nbits 0 :type fixnum))           ; number of pending bits in ACCUM
+   (nbits 0 :type fixnum))           ; number of pending bits in ACCUM
+
+;;; The hot bit-I/O loops touch these accessors millions of times per call;
+;;; keep them open-coded (both readers and writers) rather than out-of-line
+;;; calls.
+(declaim (inline bw-buffer bw-size bw-pos bw-accum bw-nbits
+                 (setf bw-buffer) (setf bw-size) (setf bw-pos)
+                 (setf bw-accum) (setf bw-nbits)))
 
 (defun make-bit-writer (initial-size)
   (%make-bit-writer :buffer (make-octet-buffer initial-size)
@@ -52,9 +59,9 @@
             (bw-size writer) (* 2 (bw-size writer)))))
   nil)
 
-;;; Little-endian machines can move whole words between the accumulator and
-;;; the output buffer; DEFLATE's LSB-first packing is exactly little-endian
-;;; byte order, so a native 32-bit store is equivalent to four byte stores.
+;;; Little-endian word access (:cl-newzlib-le is detected in util.lisp, which
+;;; loads before this file; the push here is kept as a backstop for direct
+;;; loading of this file on its own).
 (eval-when (:compile-toplevel :load-toplevel :execute)
   #+sbcl (when (eq sb-c:*backend-byte-order* :little-endian)
            (pushnew :cl-newzlib-le *features*)))
@@ -166,7 +173,11 @@ needed."
   (pos 0 :type fixnum)              ; next byte index in buffer
   (end 0 :type fixnum)              ; one past last available byte
   (accum 0 :type (unsigned-byte 64)); pending bits, low NBITS significant
-  (nbits 0 :type fixnum))           ; number of valid bits in ACCUM
+   (nbits 0 :type fixnum))           ; number of valid bits in ACCUM
+
+(declaim (inline br-buffer br-pos br-end br-accum br-nbits
+                 (setf br-buffer) (setf br-pos) (setf br-end)
+                 (setf br-accum) (setf br-nbits)))
 
 (defun make-bit-reader (buffer &optional (start 0) (end (length buffer)))
   (%make-bit-reader :buffer buffer :pos start :end end))

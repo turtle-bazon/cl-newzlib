@@ -7,14 +7,11 @@
 ;;; emission.  For each block we build Huffman codes from the token
 ;;; frequencies and pick the cheapest of stored / fixed / dynamic encoding.
 ;;;
-;;; Positions stored in the hash chains are 16-bit residues (position mod
-;;; 2^16), exactly like zlib's u16 head/prev tables: chains are walked by
-;;; converting a residue back to an absolute candidate with
-;;; CAND = POS - ((POS - RESIDUE) mod 2^16), and any candidate whose distance
-;;; exceeds the window (or the current position) terminates the walk.  Stale
-;;; entries left over from earlier inputs can only produce spurious byte
-;;; comparisons -- every match is verified against the actual input bytes --
-;;; never wrong output, so the tables need not be cleared between calls.
+;;; Hash heads and chain links store absolute input positions (32-bit, with
+;;; #xFFFFFFFF as the empty-bucket sentinel), so each chain step needs only
+;;; a single window-limit comparison to stay inside the 32 KiB window.
+;;; Tables are cleared on every acquire, keeping compression fully
+;;; deterministic across calls.
 ;;;
 ;;; All large per-call scratch (hash tables, token arrays, frequency counts,
 ;;; Huffman work arrays, the output bit-writer) lives in an LZ77-SCRATCH
@@ -91,6 +88,8 @@
 
 ;;; Return-type proclamations keep the callers' token bookkeeping fully
 ;;; unboxed (the multiple values feed straight into fixnum arithmetic).
+;;; Head values are absolute positions (or #xFFFFFFFF when empty), which fit
+;;; in a fixnum everywhere this code runs.
 (declaim (ftype (function * (values fixnum &optional)) insert-string)
          (ftype (function * (values fixnum fixnum &optional)) longest-match))
 
@@ -108,96 +107,91 @@
 (declaim (inline insert-string))
 (defun insert-string (input pos head prev)
   "Insert POS into the hash chain for its 3-byte hash.  Returns the previous
-head of the chain (a 16-bit position residue, like zlib's INSERT_STRING
-match_head)."
+head of the chain (an absolute position, or #xFFFFFFFF for an empty bucket,
+like zlib's INSERT_STRING match_head)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) head prev)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type fixnum pos))
-  (let ((h (hash-3 input pos))
-        (res (ldb (byte 16 0) pos)))
-    (declare (type fixnum h res))
+  (let ((h (hash-3 input pos)))
+    (declare (type fixnum h))
     (let ((old (aref head h)))
       (setf (aref prev (logand pos +window-mask+)) old
-            (aref head h) res)
+            (aref head h) pos)
       old)))
 
 (defun longest-match (input pos end first-res head prev max-chain nice good best-len)
   "Find the longest match for the string starting at INPUT[POS], ignoring
 matches no longer than BEST-LEN (zlib seeds this with the pending lazy match
-length).  FIRST-RES is the first chain entry as a 16-bit position residue
-(the hash head captured before POS was inserted, so it never equals POS).
-Returns (VALUES LENGTH DISTANCE).  Overlapping matches are allowed (the byte
-being matched at POS+LEN is the byte DISTANCE positions back), so runs
-longer than the distance are handled."
+length).  FIRST-RES is the chain head captured before POS was inserted (an
+absolute position, or #xFFFFFFFF for an empty bucket), so it never equals
+POS.  Returns (VALUES LENGTH DISTANCE).  Overlapping matches are allowed
+(the byte being matched at POS+LEN is the byte DISTANCE positions back), so
+runs longer than the distance are handled."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) head prev)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type fixnum pos end first-res max-chain nice good best-len))
-  (labels ((extend-match (cand start-len)
-             "Longest run INPUT[POS+LEN..] == INPUT[CAND+LEN..] starting at
-START-LEN, bounded by END and +MAX-MATCH+.  The bulk comparison goes
-through LEADING-EQUAL-OCTETS (SIMD-accelerated where available; its array
+  ;; Both bounds depend only on POS/END, so they are computed once per call
+  ;; rather than once per chain candidate: MATCH-LIMIT caps extension length,
+  ;; WINDOW-LIMIT (possibly negative early in the input, which simply never
+  ;; triggers) ends the walk past the 32 KiB window with a single comparison.
+  (let ((match-limit (min (- end pos) +max-match+))
+        (window-limit (- pos +max-dist+)))
+    (declare (type fixnum match-limit window-limit))
+    (labels ((extend-match (cand start-len)
+               "Longest run INPUT[POS+LEN..] == INPUT[CAND+LEN..] starting at
+START-LEN, bounded by MATCH-LIMIT.  The bulk comparison goes through
+LEADING-EQUAL-OCTETS (SIMD-accelerated where available; its array
 accesses are GC-safe without pinning)."
-             (declare (type fixnum cand start-len))
-             (let ((limit (min (- end pos) +max-match+)))
-               (declare (type fixnum limit))
-               (if (< start-len limit)
+               (declare (type fixnum cand start-len))
+               (if (< start-len match-limit)
                    (+ start-len
                       (leading-equal-octets input
                                             (+ pos start-len)
                                             (+ cand start-len)
-                                            (- limit start-len)))
-                   start-len)))
-           (walk ()
-             (let ((best-dist 0)
-                   (chain 0)
-                   (res first-res))
-               (declare (type fixnum best-dist chain res))
-               (when (>= best-len good)
-                 (setf max-chain (ash max-chain -2)))
-               ;; INPUT[POS..POS+1] never change across candidates, so hoist
-               ;; them out of the walk; only the best-len-dependent and
-               ;; candidate bytes stay inline.
-               (let ((p0 (aref input pos))
-                     (p1 (aref input (1+ pos))))
-                 (declare (type fixnum p0 p1))
-                 (loop
-                   ;; an empty-bucket or exhausted-chain sentinel ends the
-                   ;; walk immediately
-                   (when (= res #xFFFF) (return))
-                   ;; convert the residue to the most recent absolute
-                   ;; position; a zero distance or one past the window (or
-                   ;; past the start of the input) ends the walk
-                   (let ((delta (logand (- pos res) #xFFFF)))
-                     (declare (type fixnum delta))
-                     ;; DELTA = 0 flags a residue aliased from 64K back;
-                     ;; DELTA > POS means a stale link from an earlier input
-                     ;; (PREV is deliberately not cleared) reaching past the
-                     ;; start; both end the walk, as does the window check
-                     (when (or (zerop delta) (> delta +max-dist+) (> delta pos))
+                                            (- match-limit start-len)))
+                   start-len))
+             (walk ()
+               (let ((best-dist 0)
+                     (chain 0)
+                     (res first-res))
+                 (declare (type fixnum best-dist chain res))
+                 (when (>= best-len good)
+                   (setf max-chain (ash max-chain -2)))
+                 ;; INPUT[POS..POS+1] never change across candidates, so hoist
+                 ;; them out of the walk; only the best-len-dependent and
+                 ;; candidate bytes stay inline.
+                 (let ((p0 (aref input pos))
+                       (p1 (aref input (1+ pos))))
+                   (declare (type fixnum p0 p1))
+                   (loop
+                     ;; an empty bucket or a link past the window ends the
+                     ;; walk immediately
+                     (when (or (= res #xFFFFFFFF) (< res window-limit))
                        (return))
                      (when (>= chain max-chain) (return))
                      (incf chain)
-                     (let ((cand (- pos delta)))
+                     (let ((cand res))
                        (declare (type fixnum cand))
                        (when (and (= p0 (aref input cand))
                                   (= p1 (aref input (1+ cand)))
                                   (< (+ pos best-len) end)
                                   (= (aref input (+ pos best-len)) (aref input (+ cand best-len)))
                                   (= (aref input (+ pos best-len -1)) (aref input (+ cand best-len -1))))
-                         (let ((distance delta))
-                           (declare (type fixnum distance))
-                           (let ((len (extend-match cand 2)))
-                             (declare (type fixnum len))
-                             (when (> len best-len)
-                               (setf best-len len
-                                     best-dist distance)
-                               (when (>= len nice) (return)))))))
-                     (setf res (aref prev (logand (- pos delta) +window-mask+)))))
-                 (values best-len best-dist)))))
-    (declare (inline extend-match walk))
-    (walk)))
+                         (let ((len (extend-match cand 2)))
+                           (declare (type fixnum len))
+                           (when (> len best-len)
+                             (setf best-len len
+                                   best-dist (- pos cand))
+                             (when (>= len nice) (return))))))
+                      (setf res (aref prev (logand res +window-mask+)))))
+                  (values best-len best-dist))))
+      (declare (inline extend-match walk))
+      (walk))))
+
+
+(declaim (inline longest-match))
 
 ;;; ------------------------------------------------------------------
 ;;; Scratch pool
@@ -211,8 +205,8 @@ accesses are GC-safe without pinning)."
 (defstruct (lz77-scratch
             (:conc-name lzs-)
             (:constructor %make-lzs))
-  (head nil :type (simple-array (unsigned-byte 16) (*)))   ; hash heads
-  (prev nil :type (simple-array (unsigned-byte 16) (*)))   ; chain links
+  (head nil :type (simple-array (unsigned-byte 32) (*)))   ; hash heads
+  (prev nil :type (simple-array (unsigned-byte 32) (*)))   ; chain links
   (sym nil :type (simple-array (unsigned-byte 16) (*)))    ; literal/length syms
   (distc nil :type (simple-array (unsigned-byte 16) (*)))  ; distance codes
   (el nil :type (simple-array (unsigned-byte 16) (*)))     ; match lengths
@@ -265,21 +259,22 @@ accesses are GC-safe without pinning)."
 (defun make-u16-vector (n)
   (make-array n :element-type '(unsigned-byte 16)))
 
+(defun make-u32-vector (n)
+  (make-array n :element-type '(unsigned-byte 32)))
+
 (defun make-fixnum-vector (n)
   (make-array n :element-type 'fixnum))
 
 (defun acquire-lz77-scratch (token-size)
   "Get a LZ77-SCRATCH whose token arrays hold at least TOKEN-SIZE entries.
-The hash heads are filled with the empty-bucket sentinel (#xFFFF); chain
-links may keep stale values -- real chains always walk back through entries
-written during the current input before they can reach them, and any bogus
-candidate is byte-verified like a real one, so stale links cost only the
-occasional wasted comparison."
+The hash heads and chain links are cleared to the empty-bucket sentinel
+(#xFFFFFFFF), so every chain terminates inside the current input and
+compression is fully deterministic across calls."
   (let ((s (with-scratch-lock (pop *scratch-pool*))))
     (unless s
       (setf s (%make-lzs
-               :head (make-u16-vector +hash-size+)
-               :prev (make-u16-vector +window-size+)
+               :head (make-u32-vector +hash-size+)
+               :prev (make-u32-vector +window-size+)
                :sym (make-u16-vector token-size)
                :distc (make-u16-vector token-size)
                :el (make-u16-vector token-size)
@@ -302,10 +297,8 @@ occasional wasted comparison."
             (lzs-distc s) (make-u16-vector token-size)
             (lzs-el s) (make-u16-vector token-size)
             (lzs-ed s) (make-u16-vector token-size)))
-    (fill (lzs-head s) #xFFFF)
-    ;; PREV is left stale on purpose: real chains terminate inside the
-    ;; current input's entries before reaching stale links in most cases,
-    ;; and stale links are always byte-verified like real ones.
+    (fill (lzs-head s) #xFFFFFFFF)
+    (fill (lzs-prev s) #xFFFFFFFF)
     s))
 
 (defun release-lz77-scratch (s)
@@ -366,19 +359,19 @@ occasional wasted comparison."
            for b = (aref input (1+ q)) then c
            for c = (aref input (+ q 2))
          do (let ((h (logand (logxor a (ash b 5) (ash c 10))
-                             +hash-mask+))
-                  (qres (ldb (byte 16 0) q)))
-              (declare (type fixnum h qres))
+                             +hash-mask+)))
+              (declare (type fixnum h))
               ;; link Q after the current chain head, like INSERT-STRING
               (setf (aref prev (logand q +window-mask+)) (aref head h)
-                    (aref head h) qres)))))
+                    (aref head h) q)))))
 
 (defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
                      sym dist el ed head prev lit-freq dist-freq)
   "LZ77 tokenization core; see RUN-LZ77.  Returns (VALUES NSYM EXTRA-BITS)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed head prev)
+           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end nice good max-chain max-lazy))
   (let ((nsym 0)
@@ -411,9 +404,10 @@ occasional wasted comparison."
                     (incf pos)))
                 (progn
                   (let ((cand (insert-string input pos head prev)))
+                    (declare (type fixnum cand))
                     (let ((mlen 0) (mdist 0))
                       (declare (type fixnum mlen mdist))
-                      (when (and (/= cand #xFFFF)
+                      (when (and (/= cand #xFFFFFFFF)
                                  (or (not have-pending)
                                      (< pending-len max-lazy)))
                         (multiple-value-bind (len d)
@@ -461,7 +455,8 @@ occasional wasted comparison."
                 (incf pos))
               (progn
                 (let ((cand (insert-string input pos head prev)))
-                  (if (= cand #xFFFF)
+                  (declare (type fixnum cand))
+                  (if (= cand #xFFFFFFFF)
                       ;; empty bucket: no candidate, emit a literal
                       (progn
                         (%emit-literal pos)
@@ -482,11 +477,11 @@ occasional wasted comparison."
 
 (defun run-lz77 (input start end level sym dist el ed lit-freq dist-freq
                  &optional (head (make-array +hash-size+
-                                             :element-type '(unsigned-byte 16)
-                                             :initial-element #xFFFF))
+                                             :element-type '(unsigned-byte 32)
+                                             :initial-element #xFFFFFFFF))
                            (prev (make-array +window-size+
-                                             :element-type '(unsigned-byte 16)
-                                             :initial-element #xFFFF)))
+                                             :element-type '(unsigned-byte 32)
+                                             :initial-element #xFFFFFFFF)))
   "Run LZ77 over INPUT[START,END), filling SYM/DIST/EL/ED (sized to the
 input length) and the symbol frequency vectors.  Returns (VALUES NSYM
 EXTRA-BITS) where EXTRA-BITS is the total number of length/distance extra
@@ -495,7 +490,8 @@ levels 4-9 use lazy matching (deflate_slow) which defers each match one
 position and only adopts it if no longer match starts on the next byte."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed head prev)
+           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end level))
   (multiple-value-bind (nsym extra-bits)

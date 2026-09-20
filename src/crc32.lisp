@@ -17,7 +17,110 @@
 
 (defvar +crc32-table+ (compute-crc32-table))
 
-#+sbcl
+;;; Slicing-by-16 tables (Intel's algorithm, as in zlib's crc32_braid):
+;;; T[k][b] is the CRC of byte b followed by k zero bytes, so sixteen input
+;;; bytes fold through sixteen parallel table lookups per iteration instead
+;;; of one lookup per byte.  T[0] is the standard table above.  Sixteen
+;;; tables (16 KiB) still fit comfortably in L1 cache.
+(defun compute-crc32-slice-tables ()
+  (let ((tables (make-array 16)))
+    (setf (aref tables 0) +crc32-table+)
+    (dotimes (k 15)
+      (let ((prev (aref tables k))
+            (cur (make-array 256 :element-type '(unsigned-byte 32))))
+        (dotimes (n 256)
+          (let ((c (aref prev n)))
+            (declare (type (unsigned-byte 32) c))
+            (setf (aref cur n)
+                  (logxor (aref +crc32-table+ (logand c #xFF))
+                          (ash c -8)))))
+        (setf (aref tables (1+ k)) cur)))
+    tables))
+
+(defvar +crc32-slice+ (compute-crc32-slice-tables))
+
+(declaim (type (simple-vector 16) +crc32-slice+))
+
+#+(and sbcl cl-newzlib-le)
+(defun crc32-update (crc octets start end)
+  "Update CRC32 starting from CRC over OCTETS[START,END)."
+  (declare (type (unsigned-byte 32) crc)
+           (type (simple-array (unsigned-byte 8) (*)) octets)
+           (type fixnum start end)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((c (logxor crc #xFFFFFFFF))
+        (t0 (aref +crc32-slice+ 0))
+        (t1 (aref +crc32-slice+ 1))
+        (t2 (aref +crc32-slice+ 2))
+        (t3 (aref +crc32-slice+ 3))
+        (t4 (aref +crc32-slice+ 4))
+        (t5 (aref +crc32-slice+ 5))
+        (t6 (aref +crc32-slice+ 6))
+        (t7 (aref +crc32-slice+ 7))
+        (t8 (aref +crc32-slice+ 8))
+        (t9 (aref +crc32-slice+ 9))
+        (t10 (aref +crc32-slice+ 10))
+        (t11 (aref +crc32-slice+ 11))
+        (t12 (aref +crc32-slice+ 12))
+        (t13 (aref +crc32-slice+ 13))
+        (t14 (aref +crc32-slice+ 14))
+        (t15 (aref +crc32-slice+ 15)))
+    (declare (type (unsigned-byte 32) c)
+             (type (simple-array (unsigned-byte 32) (*))
+                   t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15))
+    ;; The SAP is taken once and the vector pinned for the whole loop, so no
+    ;; allocation may occur inside: every operation below is an unboxed
+    ;; fixnum/word op at this safety/optimize setting, keeping the SAP valid.
+    (sb-sys:with-pinned-objects (octets)
+      (let ((sap (sb-sys:vector-sap octets))
+            (i start))
+        (declare (type fixnum i))
+        (loop while (>= (- end i) 16) do
+          (let ((w0 (sb-sys:sap-ref-32 sap i))
+                (w1 (sb-sys:sap-ref-32 sap (+ i 4)))
+                (w2 (sb-sys:sap-ref-32 sap (+ i 8)))
+                (w3 (sb-sys:sap-ref-32 sap (+ i 12))))
+            (declare (type (unsigned-byte 32) w0 w1 w2 w3))
+            (setf c (logxor c w0))
+            (setf c (logxor (aref t15 (logand c #xFF))
+                            (aref t14 (logand (ash c -8) #xFF))
+                            (aref t13 (logand (ash c -16) #xFF))
+                            (aref t12 (ash c -24))
+                            (aref t11 (logand w1 #xFF))
+                            (aref t10 (logand (ash w1 -8) #xFF))
+                            (aref t9 (logand (ash w1 -16) #xFF))
+                            (aref t8 (ash w1 -24))
+                            (aref t7 (logand w2 #xFF))
+                            (aref t6 (logand (ash w2 -8) #xFF))
+                            (aref t5 (logand (ash w2 -16) #xFF))
+                            (aref t4 (ash w2 -24))
+                            (aref t3 (logand w3 #xFF))
+                            (aref t2 (logand (ash w3 -8) #xFF))
+                            (aref t1 (logand (ash w3 -16) #xFF))
+                            (aref t0 (ash w3 -24))))
+            (incf i 16)))
+        ;; medium tail: one 8-byte fold with tables 0..7
+        (loop while (>= (- end i) 8) do
+          (let ((w0 (sb-sys:sap-ref-32 sap i))
+                (w1 (sb-sys:sap-ref-32 sap (+ i 4))))
+            (declare (type (unsigned-byte 32) w0 w1))
+            (setf c (logxor c w0))
+            (setf c (logxor (aref t7 (logand c #xFF))
+                            (aref t6 (logand (ash c -8) #xFF))
+                            (aref t5 (logand (ash c -16) #xFF))
+                            (aref t4 (ash c -24))
+                            (aref t3 (logand w1 #xFF))
+                            (aref t2 (logand (ash w1 -8) #xFF))
+                            (aref t1 (logand (ash w1 -16) #xFF))
+                            (aref t0 (ash w1 -24))))
+            (incf i 8)))
+        ;; scalar tail (fewer than 8 bytes left)
+        (loop for j fixnum from i below end do
+          (setf c (logxor (aref t0 (logand #xFF (logxor c (aref octets j))))
+                          (ash c -8))))))
+    (logxor c #xFFFFFFFF)))
+
+#+(and sbcl (not cl-newzlib-le))
 (defun crc32-update (crc octets start end)
   "Update CRC32 starting from CRC over OCTETS[START,END)."
   (declare (type (unsigned-byte 32) crc)

@@ -14,6 +14,13 @@
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))
 
+;;; Little-endian machines can move whole words between a bit accumulator
+;;; and an octet vector (DEFLATE's LSB-first packing is exactly little-endian
+;;; byte order).  Detect once, early, so every later file can gate on it.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  #+sbcl (when (eq sb-c:*backend-byte-order* :little-endian)
+           (pushnew :cl-newzlib-le *features*)))
+
 ;;; SBCL-specific: assert an arithmetic RESULT type so the compiler emits a
 ;;; narrow VOP instead of a generic/bignum-safe fallback for the hot bit-I/O
 ;;; shifts.  On other implementations it degrades to the standard THE.

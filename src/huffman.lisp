@@ -132,6 +132,11 @@
   (fast nil :read-only t :type (simple-array fixnum (*)))
   (index-root 0 :read-only t :type fixnum))
 
+;;; Huffman decode runs once per output symbol; keep its table accessors
+;;; open-coded in the inflate loop.
+(declaim (inline hdt-counts hdt-first hdt-offsets hdt-symbols hdt-max-length
+                 hdt-root hdt-fast hdt-index-root))
+
 (defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
                                              (root 10))
   "Build a canonical Huffman decode table from the code lengths in
@@ -275,6 +280,8 @@ can be emitted directly with the LSB-first writer."
     (dotimes (i len res)
       (setf res (logior (ash res 1) (logand code 1))
             code (ash code -1)))))
+
+(declaim (inline reverse-bits))
 
 ;;; The static trees are built eagerly at load time.  Lazy check-then-act
 ;;; initialization of these four globals was a data race under concurrent

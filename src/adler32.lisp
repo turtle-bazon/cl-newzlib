@@ -12,10 +12,10 @@
 
 (defconstant +adler-mod+ 65521)
 ;;; Fold both sums modulo +adler-mod+ at least every +adler-chunk+ bytes.
-;;; 4096 keeps the worst-case 32-bit growth of the four-way-unrolled loop
-;;; (s2 gains at most ~4*s1 per block, s1 at most 1020 per block) far below
-;;; 2^32, mirroring zlib's NMAX analysis.
-(defconstant +adler-chunk+ 4096)
+;;; 2048 keeps the worst-case 32-bit growth of the eight-way-unrolled loop
+;;; (s2 gains at most ~8*s1 per group) safely below 2^32, mirroring zlib's
+;;; NMAX analysis.
+(defconstant +adler-chunk+ 2048)
 
 (declaim (inline %adler32))
 (defun %adler32 (octets start end s1 s2)
@@ -30,21 +30,30 @@
             s2 (mod s2 +adler-mod+))
       (let ((chunk-end (min end (+ i +adler-chunk+))))
         (declare (type fixnum chunk-end))
-        ;; four bytes at a time: the two sums are updated with independent
-        ;; expressions, breaking the serial dependency of the naive loop
-        (let ((block-end (- chunk-end (mod (- chunk-end i) 4))))
+        ;; eight bytes at a time: all eight loads are independent, then two
+        ;; short dependency chains (s1, s2) that the CPU overlaps
+        (let ((block-end (- chunk-end (mod (- chunk-end i) 8))))
           (declare (type fixnum block-end))
           (loop while (< i block-end) do
-            (let* ((b0 (aref octets i))
-                   (b1 (aref octets (+ i 1)))
-                   (b2 (aref octets (+ i 2)))
-                   (b3 (aref octets (+ i 3)))
-                   (s1-0 s1))
-              (declare (type (unsigned-byte 32) b0 b1 b2 b3 s1-0)
-                       (type fixnum b0 b1 b2 b3))
-              (setf s2 (+ s2 (* 4 s1-0) (* 4 b0) (* 3 b1) (* 2 b2) b3)
-                    s1 (+ s1-0 b0 b1 b2 b3)
-                    i (+ i 4)))))
+            (let ((b0 (aref octets i))
+                  (b1 (aref octets (+ i 1)))
+                  (b2 (aref octets (+ i 2)))
+                  (b3 (aref octets (+ i 3)))
+                  (b4 (aref octets (+ i 4)))
+                  (b5 (aref octets (+ i 5)))
+                  (b6 (aref octets (+ i 6)))
+                  (b7 (aref octets (+ i 7))))
+              (declare (type (unsigned-byte 32) b0 b1 b2 b3 b4 b5 b6 b7)
+                       (type fixnum b0 b1 b2 b3 b4 b5 b6 b7))
+              (setf s1 (+ s1 b0) s2 (+ s2 s1)
+                    s1 (+ s1 b1) s2 (+ s2 s1)
+                    s1 (+ s1 b2) s2 (+ s2 s1)
+                    s1 (+ s1 b3) s2 (+ s2 s1)
+                    s1 (+ s1 b4) s2 (+ s2 s1)
+                    s1 (+ s1 b5) s2 (+ s2 s1)
+                    s1 (+ s1 b6) s2 (+ s2 s1)
+                    s1 (+ s1 b7) s2 (+ s2 s1)
+                    i (+ i 8)))))
         ;; tail bytes
         (loop while (< i chunk-end) do
           (setf s1 (+ s1 (aref octets i))

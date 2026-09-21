@@ -192,6 +192,9 @@ because every extension is at least 2 bytes long, so (> LEN 0) and
                  ;; Bulk extension goes through LEADING-EQUAL-OCTETS
                  ;; (SIMD-accelerated where available); the two leading bytes
                  ;; were already verified above so comparison starts at 2.
+                 ;; (A scalar-first probe was tried: ~80% of extensions do
+                 ;; mismatch early, but the probe taxes long matches with
+                 ;; both probe and call, netting out negative.  Kept SIMD.)
                  (let ((,g-len (if (< 2 ,g-limit)
                                    (+ 2 (leading-equal-octets
                                          ,g-input (+ ,g-pos 2) (+ ,g-cand 2)

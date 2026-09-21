@@ -137,6 +137,20 @@
 (declaim (inline hdt-counts hdt-first hdt-offsets hdt-symbols hdt-max-length
                  hdt-root hdt-fast hdt-index-root))
 
+;;; Bit reversal for canonical codes.  Defined before the table builder so
+;;; its calls there open-code (it is also used by the static-tree code
+;;; below).  The loop is tiny; the builder calls it once per short symbol.
+(defun reverse-bits (code len)
+  (declare (optimize (speed 3) (safety 0))
+           (type fixnum code len))
+  (let ((res 0))
+    (declare (type fixnum res))
+    (dotimes (i len res)
+      (setf res (logior (ash res 1) (logand code 1))
+            code (ash code -1)))))
+
+(declaim (inline reverse-bits))
+
 (defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
                                              (root 10))
   "Build a canonical Huffman decode table from the code lengths in
@@ -160,24 +174,34 @@ a HUFFMAN-DECODE-TABLE."
           (when (> l +max-code-length+)
             (error 'newzlib-format-error :detail "code length exceeds 15"))
           (incf (aref counts l)))))
-    ;; verify the lengths satisfy Kraft's inequality
+    ;; verify the lengths satisfy Kraft's inequality.  The shift count is
+    ;; statically 0..14 (L ranges 1..15), but that needs asserting for the
+    ;; compiler to emit a single-direction shift.
     (let ((kraft 0))
       (loop for l from 1 to +max-code-length+ do
-        (setf kraft (+ kraft (ash (aref counts l) (- +max-code-length+ l))))
+        (setf kraft (+ kraft (ash (aref counts l)
+                                  (the (integer 0 14)
+                                       (- +max-code-length+ l)))))
         (setf (aref offsets l) (+ (aref offsets (1- l)) (aref counts (1- l))))
         (setf (aref first l) (ash (+ (aref first (1- l)) (aref counts (1- l))) 1)))
       (when (> kraft (ash 1 +max-code-length+))
         (error 'newzlib-format-error :detail "invalid Huffman code lengths")))
     (let ((symbols (make-array n :element-type 'fixnum :initial-element 0))
+          (cursors (make-array (1+ +max-code-length+) :element-type 'fixnum
+                               :initial-element 0))
           (max-length 0))
-      (declare (type (simple-array fixnum (*)) symbols))
-      (loop for l from 1 to +max-code-length+
-            for k fixnum = (aref offsets l) then k do
-        (when (plusp (aref counts l))
-          (loop for i from start below (+ start n) do
-            (when (= (aref lengths i) l)
-              (setf (aref symbols k) (- i start))
-              (incf k)))))
+      (declare (type (simple-array fixnum (*)) symbols cursors))
+      ;; counting placement: copy the per-length start offsets into cursors,
+      ;; then place every symbol in a single pass ordered by (length, index)
+      ;; instead of scanning all N symbols for each of the 15 lengths.
+      (loop for l from 1 to +max-code-length+ do
+        (setf (aref cursors l) (aref offsets l)))
+      (loop for i from start below (+ start n) do
+        (let ((l (aref lengths i)))
+          (declare (type fixnum l))
+          (when (plusp l)
+            (setf (aref symbols (aref cursors l)) (- i start))
+            (incf (aref cursors l)))))
       (loop for l from +max-code-length+ downto 1
             when (plusp (aref counts l)) do (setf max-length l) (return))
       (let ((root (min (max 1 root) max-length)))
@@ -197,9 +221,10 @@ a HUFFMAN-DECODE-TABLE."
               (let* ((sym (aref symbols k))
                      (entry (logior (ash l 9) sym))
                      (c (+ (aref first l) (- k (aref offsets l))))
-                     (idx (reverse-bits c l)))
-                (declare (type fixnum sym entry c idx))
-                (dotimes (i (ash 1 (- root l)))
+                     (idx (reverse-bits c l))
+                     (rep (ash 1 (the (integer 0 14) (- root l)))))
+                (declare (type fixnum sym entry c idx rep))
+                (dotimes (i rep)
                   (setf (aref fast idx) entry)
                   (incf idx (ash 1 l))))))
           (make-hdt counts first offsets symbols max-length root fast index-root))))))
@@ -274,14 +299,6 @@ can be emitted directly with the LSB-first writer."
             (setf (aref codes n) (reverse-bits (aref next len) len))
             (incf (aref next len))))))
     (values codes lengths)))
-
-(defun reverse-bits (code len)
-  (let ((res 0))
-    (dotimes (i len res)
-      (setf res (logior (ash res 1) (logand code 1))
-            code (ash code -1)))))
-
-(declaim (inline reverse-bits))
 
 ;;; The static trees are built eagerly at load time.  Lazy check-then-act
 ;;; initialization of these four globals was a data race under concurrent

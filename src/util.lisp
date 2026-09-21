@@ -21,6 +21,14 @@
   #+sbcl (when (eq sb-c:*backend-byte-order* :little-endian)
            (pushnew :cl-newzlib-le *features*)))
 
+;;; Implementations whose fixnums hold 33+ bits carry 32-bit checksum words
+;;; as immediates, so table-driven slicing CRC/adler loops run without
+;;; boxing; narrower implementations keep the split-word scalar fallbacks.
+;;; Detected once, early, for the same reason as above.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (> most-positive-fixnum #xFFFFFFFF)
+    (pushnew :cl-newzlib-wide-fixnum *features*)))
+
 ;;; SBCL-specific: assert an arithmetic RESULT type so the compiler emits a
 ;;; narrow VOP instead of a generic/bignum-safe fallback for the hot bit-I/O
 ;;; shifts.  On other implementations it degrades to the standard THE.

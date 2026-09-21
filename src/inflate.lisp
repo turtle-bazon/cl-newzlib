@@ -155,12 +155,15 @@ which is fine because the operation aborts."
              (type (simple-array (unsigned-byte 8) (*)) rbuf)
              (type (simple-array fixnum (*))
                    lfast dfast lcounts lfirst lsyms dcounts dfirst dsyms))
+    ;; Pin the input for the whole token loop and take its SAP once: the
+    ;; refill paths below then perform no allocation at all (no per-refill
+    ;; SAP consing), so no GC can intervene.  Output growth allocates fresh
+    ;; vectors but never moves RBUF, keeping RSAP valid throughout.
+    (with-pinned-input (rsap rbuf)
     (macrolet
         ((refill-bits (need)
            ;; Top ACCUM up to at least NEED bits from RBUF.  Signals
            ;; NEWZLIB-END-OF-INPUT when the input is exhausted first.
-           ;; No allocation happens between taking the SAP and the loads,
-           ;; so the vector cannot move out from under it even unpinned.
            `(loop while (< nbits ,need) do
               (when (>= rpos rend)
                 (setf (br-accum reader) accum
@@ -168,13 +171,12 @@ which is fine because the operation aborts."
                       (br-pos reader) rpos)
                 (error 'newzlib-end-of-input))
               #+(and sbcl cl-newzlib-le)
-              (let ((sap (sb-sys:vector-sap rbuf)))
-                (loop while (and (<= nbits 24) (<= (+ rpos 4) rend)) do
-                  (setf accum (logior accum
-                                      (definitely-the (unsigned-byte 64)
-                                        (ash (%word-at sap rpos) nbits)))
-                        nbits (+ nbits 32)
-                        rpos (+ rpos 4))))
+              (loop while (and (<= nbits 24) (<= (+ rpos 4) rend)) do
+                (setf accum (logior accum
+                                    (definitely-the (unsigned-byte 64)
+                                      (ash (%word-at rsap rpos) nbits)))
+                      nbits (+ nbits 32)
+                      rpos (+ rpos 4)))
               (when (< rpos rend)
                 (setf accum (logior accum
                                     (definitely-the (unsigned-byte 64)
@@ -188,13 +190,12 @@ which is fine because the operation aborts."
            ;; still decodes.  Mirrors PEEK-BITS-CAPPED.
            `(loop while (and (< nbits ,need) (< rpos rend)) do
               #+(and sbcl cl-newzlib-le)
-              (let ((sap (sb-sys:vector-sap rbuf)))
-                (loop while (and (< nbits 17) (<= (+ rpos 4) rend)) do
-                  (setf accum (logior accum
-                                      (definitely-the (unsigned-byte 64)
-                                        (ash (%word-at sap rpos) nbits)))
-                        nbits (+ nbits 32)
-                        rpos (+ rpos 4))))
+              (loop while (and (< nbits 17) (<= (+ rpos 4) rend)) do
+                (setf accum (logior accum
+                                    (definitely-the (unsigned-byte 64)
+                                      (ash (%word-at rsap rpos) nbits)))
+                      nbits (+ nbits 32)
+                      rpos (+ rpos 4)))
               (when (< rpos rend)
                 (setf accum (logior accum
                                     (definitely-the (unsigned-byte 64)
@@ -302,6 +303,14 @@ which is fine because the operation aborts."
                        (setf buffer nbuffer
                              size nsize)
                        (cond
+                         ;; tiny matches (the common case: ~60% are <= 8
+                         ;; bytes): a forward scalar loop beats the REPLACE
+                         ;; call overhead, and is overlap-safe by construction
+                         ((<= length 8)
+                          (loop for k fixnum below length do
+                            (setf (aref buffer (+ pos k))
+                                  (aref buffer (+ src k))))
+                          (incf pos length))
                          ;; run-length copy: every byte repeats the one before
                          ((= distance 1)
                           (let ((b (aref buffer (1- pos))))
@@ -334,7 +343,7 @@ which is fine because the operation aborts."
                                                 :end1 (+ pos done chunk)
                                                 :end2 (+ pos chunk))
                                        (incf done chunk))))
-                           (incf pos length)))))))))))))))
+                           (incf pos length))))))))))))))))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------

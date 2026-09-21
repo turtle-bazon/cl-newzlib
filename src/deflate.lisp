@@ -90,8 +90,7 @@
 ;;; unboxed (the multiple values feed straight into fixnum arithmetic).
 ;;; Head values are absolute positions (or #xFFFFFFFF when empty), which fit
 ;;; in a fixnum everywhere this code runs.
-(declaim (ftype (function * (values fixnum &optional)) insert-string)
-         (ftype (function * (values fixnum fixnum &optional)) longest-match))
+(declaim (ftype (function * (values fixnum &optional)) insert-string))
 
 (declaim (inline hash-3))
 (defun hash-3 (input pos)
@@ -120,78 +119,91 @@ like zlib's INSERT_STRING match_head)."
             (aref head h) pos)
       old)))
 
-(defun longest-match (input pos end first-res head prev max-chain nice good best-len)
+(defmacro longest-match (input pos end first-res head prev max-chain nice good best-len)
   "Find the longest match for the string starting at INPUT[POS], ignoring
 matches no longer than BEST-LEN (zlib seeds this with the pending lazy match
 length).  FIRST-RES is the chain head captured before POS was inserted (an
 absolute position, or #xFFFFFFFF for an empty bucket), so it never equals
-POS.  Returns (VALUES LENGTH DISTANCE).  Overlapping matches are allowed
-(the byte being matched at POS+LEN is the byte DISTANCE positions back), so
-runs longer than the distance are handled."
-  (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 32) (*)) head prev)
-           (type fixnum pos end first-res max-chain nice good best-len))
-  ;; Both bounds depend only on POS/END, so they are computed once per call
-  ;; rather than once per chain candidate: MATCH-LIMIT caps extension length,
-  ;; WINDOW-LIMIT (possibly negative early in the input, which simply never
-  ;; triggers) ends the walk past the 32 KiB window with a single comparison.
-  (let ((match-limit (min (- end pos) +max-match+))
-        (window-limit (- pos +max-dist+)))
-    (declare (type fixnum match-limit window-limit))
-    (labels ((extend-match (cand start-len)
-               "Longest run INPUT[POS+LEN..] == INPUT[CAND+LEN..] starting at
-START-LEN, bounded by MATCH-LIMIT.  The bulk comparison goes through
-LEADING-EQUAL-OCTETS (SIMD-accelerated where available; its array
-accesses are GC-safe without pinning)."
-               (declare (type fixnum cand start-len))
-               (if (< start-len match-limit)
-                   (+ start-len
-                      (leading-equal-octets input
-                                            (+ pos start-len)
-                                            (+ cand start-len)
-                                            (- match-limit start-len)))
-                   start-len))
-             (walk ()
-               (let ((best-dist 0)
-                     (chain 0)
-                     (res first-res))
-                 (declare (type fixnum best-dist chain res))
-                 (when (>= best-len good)
-                   (setf max-chain (ash max-chain -2)))
-                 ;; INPUT[POS..POS+1] never change across candidates, so hoist
-                 ;; them out of the walk; only the best-len-dependent and
-                 ;; candidate bytes stay inline.
-                 (let ((p0 (aref input pos))
-                       (p1 (aref input (1+ pos))))
-                   (declare (type fixnum p0 p1))
-                   (loop
-                     ;; an empty bucket or a link past the window ends the
-                     ;; walk immediately
-                     (when (or (= res #xFFFFFFFF) (< res window-limit))
-                       (return))
-                     (when (>= chain max-chain) (return))
-                     (incf chain)
-                     (let ((cand res))
-                       (declare (type fixnum cand))
-                       (when (and (= p0 (aref input cand))
-                                  (= p1 (aref input (1+ cand)))
-                                  (< (+ pos best-len) end)
-                                  (= (aref input (+ pos best-len)) (aref input (+ cand best-len)))
-                                  (= (aref input (+ pos best-len -1)) (aref input (+ cand best-len -1))))
-                         (let ((len (extend-match cand 2)))
-                           (declare (type fixnum len))
-                           (when (> len best-len)
-                             (setf best-len len
-                                   best-dist (- pos cand))
-                             (when (>= len nice) (return))))))
-                      (setf res (aref prev (logand res +window-mask+)))))
-                  (values best-len best-dist))))
-      (declare (inline extend-match walk))
-      (walk))))
+POS.  Expands to a form returning (VALUES LENGTH DISTANCE).  Overlapping
+matches are allowed (the byte being matched at POS+LEN is the byte DISTANCE
+positions back), so runs longer than the distance are handled.
 
+A macro rather than a function so the chain walk always expands inline at
+its two %LZ77-SEARCH call sites: no call/return or multiple-value
+plumbing per searched position, and the walk shares the caller's
+registers.  Arguments must be side-effect-free (all call sites pass
+variables or constants); each is evaluated exactly once.  HEAD is not
+evaluated (the walk only follows PREV links from FIRST-RES).
 
-(declaim (inline longest-match))
+The seed BEST-LEN is clamped to a minimum of 1: with a 0 seed the
+best-len-1 lookahead below would index -1 when the candidate sits at
+position 0 (C's longest_match reads window[-1] there -- harmless in C,
+a bounds error in checked Lisp).  Clamping is acceptance-identical
+because every extension is at least 2 bytes long, so (> LEN 0) and
+(> LEN 1) agree."
+  (let ((g-input (gensym "INPUT")) (g-pos (gensym "POS")) (g-end (gensym "END"))
+        (g-res (gensym "RES")) (g-prev (gensym "PREV"))
+        (g-max (gensym "MAX")) (g-nice (gensym "NICE")) (g-good (gensym "GOOD"))
+        (g-best (gensym "BEST")) (g-dist (gensym "DIST"))
+        (g-chain (gensym "CHAIN")) (g-limit (gensym "LIMIT"))
+        (g-window (gensym "WINDOW")) (g-p0 (gensym "P0")) (g-p1 (gensym "P1"))
+        (g-cand (gensym "CAND")) (g-len (gensym "LEN")))
+    `(let ((,g-input ,input) (,g-pos ,pos) (,g-end ,end) (,g-res ,first-res)
+           (,g-prev ,prev) (,g-max ,max-chain)
+           (,g-nice ,nice) (,g-good ,good) (,g-best (max ,best-len 1))
+           (,g-dist 0) (,g-chain 0))
+       (declare (optimize (speed 3) (safety 0))
+                (type (simple-array (unsigned-byte 8) (*)) ,g-input)
+                (type (simple-array (unsigned-byte 32) (*)) ,g-prev)
+                (type fixnum ,g-pos ,g-end ,g-res ,g-max ,g-nice ,g-good
+                      ,g-best ,g-dist ,g-chain))
+       ;; Both bounds depend only on POS/END, so they are computed once per
+       ;; call rather than once per chain candidate: MATCH-LIMIT caps
+       ;; extension length, WINDOW-LIMIT (possibly negative early in the
+       ;; input, which simply never triggers) ends the walk past the 32 KiB
+       ;; window with a single comparison.
+       (let ((,g-limit (min (- ,g-end ,g-pos) +max-match+))
+             (,g-window (- ,g-pos +max-dist+)))
+         (declare (type fixnum ,g-limit ,g-window))
+         (when (>= ,g-best ,g-good)
+           (setf ,g-max (ash ,g-max -2)))
+         ;; INPUT[POS..POS+1] never change across candidates, so hoist them
+         ;; out of the walk; only the best-len-dependent and candidate bytes
+         ;; stay inline.
+         (let ((,g-p0 (aref ,g-input ,g-pos))
+               (,g-p1 (aref ,g-input (1+ ,g-pos))))
+           (declare (type fixnum ,g-p0 ,g-p1))
+           (loop
+             ;; an empty bucket or a link past the window ends the walk
+             ;; immediately
+             (when (or (= ,g-res #xFFFFFFFF) (< ,g-res ,g-window))
+               (return))
+             (when (>= ,g-chain ,g-max) (return))
+             (incf ,g-chain)
+             (let ((,g-cand ,g-res))
+               (declare (type fixnum ,g-cand))
+               (when (and (= ,g-p0 (aref ,g-input ,g-cand))
+                          (= ,g-p1 (aref ,g-input (1+ ,g-cand)))
+                          (< (+ ,g-pos ,g-best) ,g-end)
+                          (= (aref ,g-input (+ ,g-pos ,g-best))
+                             (aref ,g-input (+ ,g-cand ,g-best)))
+                          (= (aref ,g-input (+ ,g-pos ,g-best -1))
+                             (aref ,g-input (+ ,g-cand ,g-best -1))))
+                 ;; Bulk extension goes through LEADING-EQUAL-OCTETS
+                 ;; (SIMD-accelerated where available); the two leading bytes
+                 ;; were already verified above so comparison starts at 2.
+                 (let ((,g-len (if (< 2 ,g-limit)
+                                   (+ 2 (leading-equal-octets
+                                         ,g-input (+ ,g-pos 2) (+ ,g-cand 2)
+                                         (- ,g-limit 2)))
+                                   2)))
+                   (declare (type fixnum ,g-len))
+                   (when (> ,g-len ,g-best)
+                     (setf ,g-best ,g-len
+                           ,g-dist (- ,g-pos ,g-cand))
+                     (when (>= ,g-len ,g-nice) (return))))))
+             (setf ,g-res (aref ,g-prev (logand ,g-res +window-mask+)))))
+         (values ,g-best ,g-dist)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Scratch pool

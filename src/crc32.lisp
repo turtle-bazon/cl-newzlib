@@ -120,22 +120,96 @@
                           (ash c -8))))))
     (logxor c #xFFFFFFFF)))
 
-#+(and sbcl (not cl-newzlib-le))
+#+(and cl-newzlib-wide-fixnum (not (and sbcl cl-newzlib-le)))
 (defun crc32-update (crc octets start end)
-  "Update CRC32 starting from CRC over OCTETS[START,END)."
+  "Update CRC32 starting from CRC over OCTETS[START,END).
+
+Portable slicing-by-16 (same fold as the SBCL little-endian path, but
+with the 32-bit words assembled from four byte loads so it runs anywhere
+with wide fixnums).  Eight bytes fold through eight parallel lookups per
+iteration instead of one lookup per byte."
   (declare (type (unsigned-byte 32) crc)
            (type (simple-array (unsigned-byte 8) (*)) octets)
            (type fixnum start end)
            (optimize (speed 3) (safety 0) (debug 0)))
-  (let ((table +crc32-table+)
-        (c (logxor crc #xFFFFFFFF)))
-    (declare (type (unsigned-byte 32) c))
-    (loop for i fixnum from start below end do
-      (setf c (logxor (aref table (logand #xFF (logxor c (aref octets i))))
-                      (ash c -8))))
+  (let ((c (logxor crc #xFFFFFFFF))
+        (t0 (aref +crc32-slice+ 0))
+        (t1 (aref +crc32-slice+ 1))
+        (t2 (aref +crc32-slice+ 2))
+        (t3 (aref +crc32-slice+ 3))
+        (t4 (aref +crc32-slice+ 4))
+        (t5 (aref +crc32-slice+ 5))
+        (t6 (aref +crc32-slice+ 6))
+        (t7 (aref +crc32-slice+ 7))
+        (t8 (aref +crc32-slice+ 8))
+        (t9 (aref +crc32-slice+ 9))
+        (t10 (aref +crc32-slice+ 10))
+        (t11 (aref +crc32-slice+ 11))
+        (t12 (aref +crc32-slice+ 12))
+        (t13 (aref +crc32-slice+ 13))
+        (t14 (aref +crc32-slice+ 14))
+        (t15 (aref +crc32-slice+ 15)))
+    (declare (type (unsigned-byte 32) c)
+             (type (simple-array (unsigned-byte 32) (*))
+                   t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15))
+    (macrolet ((load32 (k)
+                 ;; little-endian 32-bit word starting at I+K
+                 `(logior (aref octets (+ i ,k))
+                          (ash (aref octets (+ i ,k 1)) 8)
+                          (ash (aref octets (+ i ,k 2)) 16)
+                          (ash (aref octets (+ i ,k 3)) 24)))
+               (fold8 (w1)
+                 ;; fold eight bytes (one word already xored into C, W1 raw)
+                 ;; through tables 7..0; evaluates to the new C
+                 `(logxor (aref t7 (logand c #xFF))
+                          (aref t6 (logand (ash c -8) #xFF))
+                          (aref t5 (logand (ash c -16) #xFF))
+                          (aref t4 (ash c -24))
+                          (aref t3 (logand ,w1 #xFF))
+                          (aref t2 (logand (ash ,w1 -8) #xFF))
+                          (aref t1 (logand (ash ,w1 -16) #xFF))
+                          (aref t0 (ash ,w1 -24)))))
+      (let ((i start))
+        (declare (type fixnum i))
+        (loop while (>= (- end i) 16) do
+          (let ((w0 (load32 0))
+                (w1 (load32 4))
+                (w2 (load32 8))
+                (w3 (load32 12)))
+            (declare (type (unsigned-byte 32) w0 w1 w2 w3))
+            (setf c (logxor c w0))
+            (setf c (logxor (aref t15 (logand c #xFF))
+                            (aref t14 (logand (ash c -8) #xFF))
+                            (aref t13 (logand (ash c -16) #xFF))
+                            (aref t12 (ash c -24))
+                            (aref t11 (logand w1 #xFF))
+                            (aref t10 (logand (ash w1 -8) #xFF))
+                            (aref t9 (logand (ash w1 -16) #xFF))
+                            (aref t8 (ash w1 -24))
+                            (aref t7 (logand w2 #xFF))
+                            (aref t6 (logand (ash w2 -8) #xFF))
+                            (aref t5 (logand (ash w2 -16) #xFF))
+                            (aref t4 (ash w2 -24))
+                            (aref t3 (logand w3 #xFF))
+                            (aref t2 (logand (ash w3 -8) #xFF))
+                            (aref t1 (logand (ash w3 -16) #xFF))
+                            (aref t0 (ash w3 -24))))
+            (incf i 16)))
+        ;; medium tail: one 8-byte fold with tables 0..7
+        (loop while (>= (- end i) 8) do
+          (let ((w0 (load32 0))
+                (w1 (load32 4)))
+            (declare (type (unsigned-byte 32) w0 w1))
+            (setf c (logxor c w0))
+            (setf c (fold8 w1))
+            (incf i 8)))
+        ;; scalar tail (fewer than 8 bytes left)
+        (loop for j fixnum from i below end do
+          (setf c (logxor (aref t0 (logand #xFF (logxor c (aref octets j))))
+                          (ash c -8))))))
     (logxor c #xFFFFFFFF)))
 
-#-sbcl
+#-(or (and sbcl cl-newzlib-le) cl-newzlib-wide-fixnum)
 (defun crc32-update (crc octets start end)
   "Update CRC32 starting from CRC over OCTETS[START,END).
 Portable path: the 32-bit working value is carried in two 16-bit words so
@@ -152,12 +226,14 @@ bits wide (Zach Beane's trick, also used by chipz)."
     (loop for i fixnum from start below end do
       (let ((index (logxor (logand low #xFF) (aref octets i))))
         (declare (type (integer 0 255) index))
-        (let ((t (aref table index)))
-          (declare (type (unsigned-byte 32) t))
+        ;; NB: named ENTRY, not T -- T is a constant and must not be bound
+        ;; (SBCL tolerates it, stricter implementations signal an error).
+        (let ((entry (aref table index)))
+          (declare (type (unsigned-byte 32) entry))
           (setf low (logxor (ash (logand high #xFF) 8)
                             (ash low -8)
-                            (logand t #xFFFF))
-                high (logxor (ash high -8) (ash t -16))))))
+                            (logand entry #xFFFF))
+                high (logxor (ash high -8) (ash entry -16))))))
     (logxor (logior (ash high 16) low) #xFFFFFFFF)))
 
 (defun crc32 (octets &optional (start 0) (end (length octets))

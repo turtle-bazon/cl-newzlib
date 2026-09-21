@@ -77,6 +77,19 @@ the system-area pointer BASE."
              (type fixnum i))
     (sb-sys:sap-ref-32 base i)))
 
+;;; Pin VECTOR for the duration of BODY and bind SAP-VAR to its system-area
+;;; pointer once, so word-at-a-time loops perform no per-access allocation.
+;;; Portable: on non-SBCL implementations this is a plain LET (SAP-VAR is
+;;; bound to NIL and the SAP-taking refill paths, which are all SBCL-only
+;;; branches, never reference it).
+(defmacro with-pinned-input ((sap-var vector) &body body)
+  #+sbcl `(sb-sys:with-pinned-objects (,vector)
+            (let ((,sap-var (sb-sys:vector-sap ,vector)))
+              ,@body))
+  #-sbcl `(let ((,sap-var nil))
+            (declare (ignore ,sap-var))
+            ,@body))
+
 (declaim (inline flush-pending-bytes))
 (defun flush-pending-bytes (writer)
   "Flush as many whole bytes as possible from the accumulator into the buffer."

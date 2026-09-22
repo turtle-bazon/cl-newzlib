@@ -41,6 +41,18 @@
 
 (declaim (type (simple-vector 16) +crc32-slice+))
 
+(defvar *pclmul-crc-impl* nil
+  "Optional hardware CRC-32 implementation: a function of (CRC OCTETS START
+END) returning (VALUES MID-CRC POS) after consuming a bulk prefix that is a
+multiple of 64 bytes (POS varies), or NIL when unavailable.  Set by
+pclmul-crc.lisp on SBCL/x86-64 little-endian machines whose CPU provides
+PCLMULQDQ; the remainder always finishes through the slicer below.")
+
+(defconstant +pclmul-threshold+ 64
+  "Minimum input length for the PCLMULQDQ path (one fold iteration).  With a
+nonzero initial CRC the 16-byte preamble runs first, so that case additionally
+requires 80 bytes for the bulk loop to engage; shorter inputs slice.")
+
 #+(and sbcl cl-newzlib-le)
 (defun crc32-update (crc octets start end)
   "Update CRC32 starting from CRC over OCTETS[START,END)."
@@ -48,6 +60,17 @@
            (type (simple-array (unsigned-byte 8) (*)) octets)
            (type fixnum start end)
            (optimize (speed 3) (safety 0) (debug 0)))
+  ;; Hardware fast path (one funcall per call, not per byte): the bulk
+  ;; prefix folds through PCLMULQDQ, the <64-byte remainder falls through
+  ;; to the slicer below, which handles any length.
+  (let ((impl *pclmul-crc-impl*))
+    (when (and impl
+                (if (zerop crc)
+                    (>= (- end start) +pclmul-threshold+)
+                    (>= (- end start) 80)))
+      (multiple-value-bind (mid pos) (funcall impl crc octets start end)
+        (setf crc mid
+              start pos))))
   (let ((c (logxor crc #xFFFFFFFF))
         (t0 (aref +crc32-slice+ 0))
         (t1 (aref +crc32-slice+ 1))

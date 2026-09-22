@@ -16,6 +16,7 @@ fast paths, aiming to compete with the C zlib implementation."
                              (:file "util")
                              (:file "adler32")
                              (:file "crc32")
+                             (:file "pclmul-crc")
                              (:file "bit-io")
                              (:file "huffman")
                              (:file "simd")

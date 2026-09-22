@@ -19,8 +19,11 @@
 ;;;   unaligned starts and nonzero initial CRCs) passes on the running CPU.
 ;;;   Anything else -- no PCLMULQDQ flag, VOP trouble, self-test mismatch --
 ;;;   leaves *pclmul-crc-impl* NIL and the library silently keeps slicing.
+;;;   (The whole file is inert without SBCL/x86-64 little-endian plus
+;;;   sb-simd: the x86-64 gate matters because the VOP emitters and sb-simd's
+;;;   CPUID helper exist only there.)
 
-#+(and sbcl cl-newzlib-le)
+#+(and sbcl x86-64 cl-newzlib-le newzlib-simd)
 (progn
   ;;; ------------------------------------------------------------------
   ;;; PCLMULQDQ VOPs, one per imm8 used (monomorphic keeps each generator
@@ -163,17 +166,13 @@
   ;;; Availability probe + load-time self-test.
   ;;; ------------------------------------------------------------------
   (defun pclmul-cpu-available-p ()
-    "True when the running CPU reports PCLMULQDQ (Linux only for now)."
-    #+linux
+    "True when CPUID leaf 1 reports PCLMULQDQ in ECX (bit 1), queried from
+inside the implementation via sb-simd's CPUID wrapper -- no /proc or other
+OS channel involved, so this works wherever SBCL/x86-64 runs."
     (handler-case
-        (with-open-file (s "/proc/cpuinfo" :direction :input)
-          (loop for line = (read-line s nil nil)
-                while line
-                when (search "pclmulqdq" line)
-                  do (return t)))
-      (error () nil))
-    #-linux
-    nil)
+        (and (>= (sb-simd-internals::cpuid 0) 1)
+             (logbitp 1 (nth-value 2 (sb-simd-internals::cpuid 1))))
+      (error () nil)))
 
   (defun pclmul-self-test-p ()
     "Randomized differential check of the hardware path against the

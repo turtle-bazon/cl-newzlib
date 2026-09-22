@@ -92,8 +92,59 @@
 (defparameter +length-code+ (compute-length-code-table))
 (defparameter +dist-code+ (compute-dist-code-table))
 
+;;; Combined lookup tables for the hot match paths: one load yields the
+;;; code plus its extra-bits count (by length/distance), or the base plus
+;;; its extra-bits count (by code).  Hot loops do ~2M of these lookups per
+;;; megabyte, so halving the table traffic matters.
+;;;
+;;; Layouts (all unsigned-32):
+;;;   +length-code+extra+[len-3]: code in bits 0..7, extra in 8..15
+;;;   +dist-code+extra+[dist-key]: dcode in 0..7, extra in 8..15, with the
+;;;     same keying as +dist-code+ (d-1 below 257, 256+((d-1)>>7) above)
+;;;   +length-base+extra+[code]: base in 0..15, extra in 16..23
+;;;   +dist-base+extra+[dcode]: base in 0..15, extra in 16..23
+
+(defun compute-length-code+extra-table ()
+  (let ((table (make-array 256 :element-type '(unsigned-byte 32))))
+    (dotimes (i 256 table)
+      (let ((code (aref +length-code+ i)))
+        (setf (aref table i)
+              (logior code (ash (aref +length-extra-bits+ code) 8)))))))
+
+(defun compute-dist-code+extra-table ()
+  (let ((table (make-array 512 :element-type '(unsigned-byte 32))))
+    (dotimes (i 512 table)
+      (let ((code (aref +dist-code+ i)))
+        (setf (aref table i)
+              (logior code (ash (aref +dist-extra-bits+ code) 8)))))))
+
+(defun compute-length-base+extra-table ()
+  (let ((table (make-array 29 :element-type '(unsigned-byte 32))))
+    (dotimes (code 29 table)
+      (setf (aref table code)
+            (logior (aref +length-base+ code)
+                    (ash (aref +length-extra-bits+ code) 16))))))
+
+(defun compute-dist-base+extra-table ()
+  (let ((table (make-array 30 :element-type '(unsigned-byte 32))))
+    (dotimes (code 30 table)
+      (setf (aref table code)
+            (logior (aref +dist-base+ code)
+                    (ash (aref +dist-extra-bits+ code) 16))))))
+
+(defparameter +length-code+extra+ (compute-length-code+extra-table))
+(defparameter +dist-code+extra+ (compute-dist-code+extra-table))
+(defparameter +length-base+extra+ (compute-length-base+extra-table))
+(defparameter +dist-base+extra+ (compute-dist-base+extra-table))
+
+(declaim (type (simple-array (unsigned-byte 32) (*))
+               +length-code+extra+ +dist-code+extra+
+               +length-base+extra+ +dist-base+extra+))
+
 (declaim (inline length-code dist-code length-extra-bits dist-extra-bits
-                 length-base dist-base))
+                 length-base dist-base
+                 length-code+extra dist-code+extra
+                 length-base+extra dist-base+extra))
 (defun length-code (match-length)
   (aref +length-code+ (- match-length 3)))
 (defun dist-code (distance)
@@ -101,6 +152,24 @@
   (if (< distance 257)
       (aref +dist-code+ (1- distance))
       (aref +dist-code+ (+ 256 (ash (1- distance) -7)))))
+(defun length-code+extra (match-length)
+  "Length code and extra-bits count for MATCH-LENGTH (3..258) packed as
+CODE | EXTRA<<8."
+  (aref +length-code+extra+ (- match-length 3)))
+(defun dist-code+extra (distance)
+  "Distance code and extra-bits count for DISTANCE, packed as
+DCODE | EXTRA<<8 (same keying as DIST-CODE)."
+  (if (< distance 257)
+      (aref +dist-code+extra+ (1- distance))
+      (aref +dist-code+extra+ (+ 256 (ash (1- distance) -7)))))
+(defun length-base+extra (code)
+  "Length base and extra-bits count for a length CODE, packed as
+BASE | EXTRA<<16."
+  (aref +length-base+extra+ code))
+(defun dist-base+extra (dcode)
+  "Distance base and extra-bits count for a distance code, packed as
+BASE | EXTRA<<16."
+  (aref +dist-base+extra+ dcode))
 (defun length-extra-bits (code) (aref +length-extra-bits+ code))
 (defun dist-extra-bits (code) (aref +dist-extra-bits+ code))
 (defun length-base (code) (aref +length-base+ code))

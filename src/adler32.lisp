@@ -11,6 +11,16 @@
 ;;; range on 32-bit implementations while avoiding a mod per byte.
 
 (defconstant +adler-mod+ 65521)
+
+(defvar *simd-adler-impl* nil
+  "Optional vectorized Adler-32: a function of (OCTETS START END
+INITIAL-ADLER) returning the checksum, or NIL when unavailable.  Set by
+simd-adler.lisp on SBCL/x86-64 machines with AVX2 (after a load-time
+self-test); shorter inputs and the <32-byte tail always use %adler32.")
+
+(defconstant +simd-adler-threshold+ 1024
+  "Minimum input length for the vector path (setup costs dominate below).")
+
 ;;; Fold both sums modulo +adler-mod+ at least every +adler-chunk+ bytes.
 ;;; 2048 keeps the worst-case 32-bit growth of the eight-way-unrolled loop
 ;;; (s2 gains at most ~8*s1 per group) safely below 2^32, mirroring zlib's
@@ -68,6 +78,10 @@
   "Return the Adler-32 checksum of OCTETS[START,END) given INITIAL-ADLER."
   (declare (type (unsigned-byte 32) initial-adler)
            (optimize (speed 3) (safety 0)))
+  ;; Vector fast path (one funcall per call, not per byte).
+  (let ((impl *simd-adler-impl*))
+    (when (and impl (>= (- end start) +simd-adler-threshold+))
+      (return-from adler32 (funcall impl octets start end initial-adler))))
   (%adler32 octets start end
             (ldb (byte 16 0) initial-adler)
             (ldb (byte 16 16) initial-adler)))

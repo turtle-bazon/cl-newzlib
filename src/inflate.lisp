@@ -116,241 +116,263 @@
 ;;; Token stream (fixed and dynamic blocks)
 ;;; ------------------------------------------------------------------
 
-(defun inflate-token-stream (reader buffer size pos lit dist)
-  "Decode literal/length-distance tokens from READER using LIT and DIST
-decode tables into BUFFER[POS..].  Returns (VALUES BUFFER POS SIZE).
+;;; Private bit primitives over INFLATE-TOKEN-STREAM's loop locals
+;;; (ACCUM NBITS RPOS REND RBUF RSAP READER, the LIT/DIST table locals,
+;;; SYM DSYM and the output BUFFER SIZE POS).  Top-level (rather than
+;;; MACROLET) so the main loop fits the function-size rule; expansions
+;;; are unchanged.
+;;; ------------------------------------------------------------------
 
-The reader's bit accumulator, bit count and input position live in local
-variables for the whole token loop (a C inflate_fast keeps them in
-registers; round-tripping them through the reader struct on every symbol
-costs a large fraction of decode time).  They are written back to READER
-when the end-of-block symbol is reached; error exits leave READER stale,
-which is fine because the operation aborts."
+(defmacro %inflate-refill (need)
+  "Top ACCUM up to at least NEED bits; signals NEWZLIB-END-OF-INPUT first."
+  `(loop while (< nbits ,need) do
+     (when (>= rpos rend)
+       (setf (br-accum reader) accum
+             (br-nbits reader) nbits
+             (br-pos reader) rpos)
+       (error 'newzlib-end-of-input))
+     #+(and sbcl cl-newzlib-le)
+     (loop while (and (<= nbits 24) (<= (+ rpos 4) rend)) do
+       (setf accum (logior accum
+                           (definitely-the (unsigned-byte 64)
+                             (ash (%word-at rsap rpos) nbits)))
+             nbits (+ nbits 32)
+             rpos (+ rpos 4)))
+     (when (< rpos rend)
+       (setf accum (logior accum
+                           (definitely-the (unsigned-byte 64)
+                             (ash (aref rbuf rpos) nbits)))
+             nbits (+ nbits 8)
+             rpos (1+ rpos)))))
+
+(defmacro %inflate-fill (need)
+  "Like %INFLATE-REFILL but never signals (short-tail peeks)."
+  `(loop while (and (< nbits ,need) (< rpos rend)) do
+     #+(and sbcl cl-newzlib-le)
+     (loop while (and (< nbits 17) (<= (+ rpos 4) rend)) do
+       (setf accum (logior accum
+                           (definitely-the (unsigned-byte 64)
+                             (ash (%word-at rsap rpos) nbits)))
+             nbits (+ nbits 32)
+             rpos (+ rpos 4)))
+     (when (< rpos rend)
+       (setf accum (logior accum
+                           (definitely-the (unsigned-byte 64)
+                             (ash (aref rbuf rpos) nbits)))
+             nbits (+ nbits 8)
+             rpos (1+ rpos)))))
+
+(defmacro %inflate-take (n)
+  "Consume N bits (caller guarantees NBITS >= N); returns a fixnum."
+  `(prog1 (definitely-the fixnum (logand accum (aref +low-bit-masks+ ,n)))
+     (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
+           nbits (- nbits ,n))))
+
+(defmacro %inflate-decode-slow (root counts first syms idx target)
+  "Canonical bit walk for codes longer than ROOT; caller already peeked."
+  `(let ((code (reverse-bits (logand accum (aref +low-bit-masks+ ,root)) ,root))
+         (index ,idx)
+         (len ,root))
+     (declare (type fixnum code index len))
+     (%inflate-refill ,root)
+     (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,root)))
+           nbits (- nbits ,root))
+     (loop
+       (incf len)
+       (when (> len +max-code-length+)
+         (error 'newzlib-format-error :detail "invalid Huffman code"))
+       (%inflate-refill 1)
+       (setf code (logior (ash code 1) (logand accum 1))
+             accum (definitely-the (unsigned-byte 64) (ash accum -1))
+             nbits (1- nbits))
+       (let ((count (aref ,counts len)))
+         (declare (type fixnum count))
+         (when (< (- code count) (aref ,first len))
+           (setf ,target (aref ,syms (+ index (- code (aref ,first len)))))
+           (return))
+         (setf index (+ index count))))))
+
+(defmacro %inflate-decode-one (root fast counts first syms idx target)
+  "Decode one symbol into TARGET (fast table, slow walk fallback)."
+  `(progn
+     (%inflate-fill ,root)
+     (let ((entry (aref ,fast (logand accum (aref +low-bit-masks+ ,root)))))
+       (declare (type fixnum entry))
+       (if (zerop entry)
+           (%inflate-decode-slow ,root ,counts ,first ,syms ,idx ,target)
+           (let ((clen (ash entry -9)))
+             (declare (type fixnum clen))
+             ;; Consume only after enough bits are known present: with a
+             ;; truncated tail this signals end-of-input instead of
+             ;; decoding garbage.
+             (%inflate-refill clen)
+             (setf accum (definitely-the (unsigned-byte 64) (ash accum (- clen)))
+                   nbits (- nbits clen)
+                   ,target (logand entry #x1FF)))))))
+
+(declaim (inline %copy-tiny-match %copy-run-match %copy-fresh-match
+                 %copy-overlap-match %copy-inflate-match))
+
+(defun %copy-tiny-match (buffer pos src length)
+  "Copy a short (<= 8 byte) match; overlap-safe.  Returns the new POS."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos src length))
+  (loop for k fixnum below length do
+    (setf (aref buffer (+ pos k)) (aref buffer (+ src k))))
+  (+ pos length))
+
+(defun %copy-run-match (buffer pos length)
+  "Copy a distance-1 run.  Returns the new POS."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos length))
+  (let ((b (aref buffer (1- pos))))
+    (fill buffer b :start pos :end (+ pos length)))
+  (+ pos length))
+
+(defun %copy-fresh-match (buffer pos src length)
+  "Copy a non-overlapping match.  Returns the new POS."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos src length))
+  (replace buffer buffer :start1 pos :start2 src
+           :end1 (+ pos length) :end2 (+ src length))
+  (+ pos length))
+
+(defun %copy-overlap-match (buffer pos src distance length)
+  "Copy an overlapping match by doubling spans.  Returns the new POS.
+Every REPLACE reads a region ending before its destination begins, so
+plain forward copying is safe, turning O(LENGTH) into O(LOG) copies."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos src distance length))
+  (let ((done distance))
+    (declare (type fixnum done))
+    (replace buffer buffer :start1 pos :start2 src
+             :end1 (+ pos done) :end2 (+ src done))
+    (loop while (< done length) do
+      (let ((chunk (min done (- length done))))
+        (declare (type fixnum chunk))
+        (replace buffer buffer :start1 (+ pos done) :start2 pos
+                 :end1 (+ pos done chunk) :end2 (+ pos chunk))
+        (incf done chunk))))
+  (+ pos length))
+
+(defun %copy-inflate-match (buffer pos src distance length)
+  "Copy one match; returns the new POS.  Tiny scalar loops (the common
+case: ~60% of matches are <= 8 bytes) beat REPLACE call overhead."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos src distance length))
+  (cond ((<= length 8) (%copy-tiny-match buffer pos src length))
+        ((= distance 1) (%copy-run-match buffer pos length))
+        ((<= length distance) (%copy-fresh-match buffer pos src length))
+        (t (%copy-overlap-match buffer pos src distance length))))
+
+(defmacro %emit-inflate-match ()
+  "Decode length/distance extras and copy one match.  Uses the loop locals
+SYM DSYM BUFFER SIZE POS (rebinding all three) plus the bit/table locals."
+  `(progn
+     (when (> sym 285)
+       (error 'newzlib-format-error :detail "invalid length code"))
+     ;; one combined load yields base and extra-bits count
+     (let* ((be (length-base+extra (- sym 257)))
+            (eb (ash be -16)))
+       (declare (type (unsigned-byte 32) be) (type fixnum eb))
+       (%inflate-refill eb)
+       (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
+         (declare (type fixnum length))
+         (%inflate-decode-one droot dfast dcounts dfirst dsyms didx dsym)
+         (when (> dsym 29)
+           (error 'newzlib-format-error :detail "invalid distance code"))
+         (let* ((bde (dist-base+extra dsym))
+                (deb (ash bde -16)))
+           (declare (type (unsigned-byte 32) bde) (type fixnum deb))
+           (%inflate-refill deb)
+           (let ((distance (+ (logand bde #xFFFF) (%inflate-take deb))))
+             (declare (type fixnum distance))
+             (when (> distance pos)
+               (error 'newzlib-format-error
+                      :detail "match distance exceeds output"))
+             (let ((src (- pos distance)))
+               (declare (type fixnum src))
+               (multiple-value-bind (nbuffer nsize)
+                   (ensure-out-capacity buffer size pos length)
+                 (setf buffer nbuffer size nsize
+                       pos (%copy-inflate-match buffer pos src distance length))))))))))
+
+(defmacro %with-inflate-tables ((lit dist) &body body)
+  "Bind LIT/DIST decode-table locals (LROOT..DIDX) with types around BODY."
+  `(let ((lroot (hdt-root ,lit)) (lfast (hdt-fast ,lit))
+         (lcounts (hdt-counts ,lit)) (lfirst (hdt-first ,lit))
+         (lsyms (hdt-symbols ,lit)) (lidx (hdt-index-root ,lit))
+         (droot (hdt-root ,dist)) (dfast (hdt-fast ,dist))
+         (dcounts (hdt-counts ,dist)) (dfirst (hdt-first ,dist))
+         (dsyms (hdt-symbols ,dist)) (didx (hdt-index-root ,dist)))
+     (declare (type fixnum lroot lidx droot didx)
+              (type (simple-array fixnum (*)) lfast lcounts lfirst lsyms
+                    dcounts dfirst dsyms))
+     ,@body))
+
+(defun inflate-token-stream (reader buffer size pos lit dist)
+  "Decode literal/length-distance tokens into BUFFER[POS..] via LIT/DIST.
+Returns (VALUES BUFFER POS SIZE).  Reader state stays in locals (like C
+inflate_fast); it is written back on end-of-block, stale on error abort."
   (declare (optimize (speed 3) (safety 0))
            (type huffman-decode-table lit dist)
            (type (simple-array (unsigned-byte 8) (*)) buffer)
            (type fixnum size pos))
-  (let ((accum (br-accum reader))
-        (nbits (br-nbits reader))
-        (rpos (br-pos reader))
-        (rend (br-end reader))
-        (rbuf (br-buffer reader))
-        (lroot (hdt-root lit))
-        (lfast (hdt-fast lit))
-        (lcounts (hdt-counts lit))
-        (lfirst (hdt-first lit))
-        (lsyms (hdt-symbols lit))
-        (lidx (hdt-index-root lit))
-        (droot (hdt-root dist))
-        (dfast (hdt-fast dist))
-        (dcounts (hdt-counts dist))
-        (dfirst (hdt-first dist))
-        (dsyms (hdt-symbols dist))
-        (didx (hdt-index-root dist))
-        (sym 0)
-        (dsym 0))
+  (let ((accum (br-accum reader)) (nbits (br-nbits reader))
+        (rpos (br-pos reader)) (rend (br-end reader))
+        (rbuf (br-buffer reader)) (sym 0) (dsym 0))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend
-                   lroot lidx droot didx sym dsym)
-             (type (simple-array (unsigned-byte 8) (*)) rbuf)
-             (type (simple-array fixnum (*))
-                   lfast dfast lcounts lfirst lsyms dcounts dfirst dsyms))
-    ;; Pin the input for the whole token loop and take its SAP once: the
-    ;; refill paths below then perform no allocation at all (no per-refill
-    ;; SAP consing), so no GC can intervene.  Output growth allocates fresh
-    ;; vectors but never moves RBUF, keeping RSAP valid throughout.
+             (type fixnum nbits rpos rend sym dsym)
+             (type (simple-array (unsigned-byte 8) (*)) rbuf))
+    ;; Pin the input once: refills below allocate nothing (no per-refill
+    ;; SAP consing), so no GC intervenes; output growth never moves RBUF.
     (with-pinned-input (rsap rbuf)
-    (macrolet
-        ((refill-bits (need)
-           ;; Top ACCUM up to at least NEED bits from RBUF.  Signals
-           ;; NEWZLIB-END-OF-INPUT when the input is exhausted first.
-           `(loop while (< nbits ,need) do
-              (when (>= rpos rend)
-                (setf (br-accum reader) accum
-                      (br-nbits reader) nbits
-                      (br-pos reader) rpos)
-                (error 'newzlib-end-of-input))
-              #+(and sbcl cl-newzlib-le)
-              (loop while (and (<= nbits 24) (<= (+ rpos 4) rend)) do
-                (setf accum (logior accum
-                                    (definitely-the (unsigned-byte 64)
-                                      (ash (%word-at rsap rpos) nbits)))
-                      nbits (+ nbits 32)
-                      rpos (+ rpos 4)))
-              (when (< rpos rend)
-                (setf accum (logior accum
-                                    (definitely-the (unsigned-byte 64)
-                                      (ash (aref rbuf rpos) nbits)))
-                      nbits (+ nbits 8)
-                      rpos (1+ rpos)))))
-         (fill-bits (need)
-           ;; Like REFILL-BITS but never signals: pull whatever input
-           ;; remains (up to NEED bits) so a short trailing code -- e.g. a
-           ;; 7-bit end-of-block with only 7 bits left and no more input --
-           ;; still decodes.  Mirrors PEEK-BITS-CAPPED.
-           `(loop while (and (< nbits ,need) (< rpos rend)) do
-              #+(and sbcl cl-newzlib-le)
-              (loop while (and (< nbits 17) (<= (+ rpos 4) rend)) do
-                (setf accum (logior accum
-                                    (definitely-the (unsigned-byte 64)
-                                      (ash (%word-at rsap rpos) nbits)))
-                      nbits (+ nbits 32)
-                      rpos (+ rpos 4)))
-              (when (< rpos rend)
-                (setf accum (logior accum
-                                    (definitely-the (unsigned-byte 64)
-                                      (ash (aref rbuf rpos) nbits)))
-                      nbits (+ nbits 8)
-                      rpos (1+ rpos)))))
-         (take-bits (n)
-           ;; Caller guarantees NBITS >= N: consume N bits and return them.
-           ;; The shift result always fits in 64 bits (we only drop bits),
-           ;; but N is a runtime value so the guard must be asserted.  The
-           ;; result is a fixnum: this is only used for length/distance
-           ;; extra bits (at most 13 bits in DEFLATE), keeping all downstream
-           ;; match arithmetic on the fixnum path.
-           `(prog1 (definitely-the fixnum (logand accum (aref +low-bit-masks+ ,n)))
-              (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
-                    nbits (- nbits ,n))))
-         (decode-one (root fast counts first syms idx target)
-           ;; Decode one symbol with the given tables into TARGET (SYM or
-           ;; DSYM): fast jump-table lookup, canonical bit walk when the
-           ;; code is longer than ROOT.  The initial peek is capped (it must
-           ;; not signal on a short tail); consuming the looked-up length
-           ;; signals end-of-input exactly like the old PEEK-BITS-CAPPED
-           ;; plus READ-BITS sequence did.
-           `(progn
-              (fill-bits ,root)
-              (let ((entry (aref ,fast (logand accum (aref +low-bit-masks+ ,root)))))
-                (declare (type fixnum entry))
-                (if (zerop entry)
-                    (let ((code (reverse-bits
-                                 (logand accum (aref +low-bit-masks+ ,root))
-                                 ,root))
-                          (index ,idx)
-                          (len ,root))
-                      (declare (type fixnum code index len))
-                      (refill-bits ,root)
-                      (setf accum (definitely-the (unsigned-byte 64)
-                                    (ash accum (- ,root)))
-                            nbits (- nbits ,root))
-                      (loop
-                        (incf len)
-                        (when (> len +max-code-length+)
-                          (error 'newzlib-format-error
-                                 :detail "invalid Huffman code"))
-                        (refill-bits 1)
-                        (setf code (logior (ash code 1) (logand accum 1))
-                              accum (definitely-the (unsigned-byte 64)
-                                      (ash accum -1))
-                              nbits (1- nbits))
-                        (let ((count (aref ,counts len)))
-                          (declare (type fixnum count))
-                          (when (< (- code count) (aref ,first len))
-                            (setf ,target
-                                  (aref ,syms (+ index (- code (aref ,first len)))))
-                            (return))
-                          (setf index (+ index count)))))
-                    (let ((clen (ash entry -9)))
-                      (declare (type fixnum clen))
-                      ;; Consume only after enough bits are known present:
-                      ;; with a truncated tail this signals end-of-input
-                      ;; instead of decoding garbage.
-                      (refill-bits clen)
-                      (setf accum (definitely-the (unsigned-byte 64)
-                                    (ash accum (- clen)))
-                            nbits (- nbits clen)
-                            ,target (logand entry #x1FF))))))))
-      (loop
-        (decode-one lroot lfast lcounts lfirst lsyms lidx sym)
-        (cond
-          ((< sym 256)
-           (multiple-value-bind (nbuffer nsize)
-               (ensure-out-capacity buffer size pos 1)
-             (setf buffer nbuffer
-                   size nsize)
-             (setf (aref buffer pos) sym)
-             (incf pos)))
-          ((= sym 256)
-           (setf (br-accum reader) accum
-                 (br-nbits reader) nbits
-                 (br-pos reader) rpos)
-           (return (values buffer pos size)))
-          (t
-           (when (> sym 285)
-             (error 'newzlib-format-error :detail "invalid length code"))
-           ;; one combined load yields base and extra-bits count
-           (let* ((be (length-base+extra (- sym 257)))
-                  (eb (ash be -16)))
-             (declare (type (unsigned-byte 32) be)
-                      (type fixnum eb))
-             (refill-bits eb)
-             (let ((length (+ (logand be #xFFFF) (take-bits eb))))
-               (declare (type fixnum length))
-               (decode-one droot dfast dcounts dfirst dsyms didx dsym)
-               (when (> dsym 29)
-                 (error 'newzlib-format-error :detail "invalid distance code"))
-               (let* ((bde (dist-base+extra dsym))
-                      (deb (ash bde -16)))
-                 (declare (type (unsigned-byte 32) bde)
-                          (type fixnum deb))
-                 (refill-bits deb)
-                 (let ((distance (+ (logand bde #xFFFF) (take-bits deb))))
-                   (declare (type fixnum distance))
-                   (when (> distance pos)
-                     (error 'newzlib-format-error
-                            :detail "match distance exceeds output"))
-                   (let ((src (- pos distance)))
-                     (declare (type fixnum src))
-                     (multiple-value-bind (nbuffer nsize)
-                         (ensure-out-capacity buffer size pos length)
-                       (setf buffer nbuffer
-                             size nsize)
-                       (cond
-                         ;; tiny matches (the common case: ~60% are <= 8
-                         ;; bytes): a forward scalar loop beats the REPLACE
-                         ;; call overhead, and is overlap-safe by construction
-                         ((<= length 8)
-                          (loop for k fixnum below length do
-                            (setf (aref buffer (+ pos k))
-                                  (aref buffer (+ src k))))
-                          (incf pos length))
-                         ;; run-length copy: every byte repeats the one before
-                         ((= distance 1)
-                          (let ((b (aref buffer (1- pos))))
-                            (fill buffer b :start pos :end (+ pos length)))
-                          (incf pos length))
-                         ;; non-overlapping copy
-                         ((<= length distance)
-                          (replace buffer buffer
-                                   :start1 pos :start2 src
-                                   :end1 (+ pos length) :end2 (+ src length))
-                          (incf pos length))
-                         ;; overlapping copy: seed the DISTANCE-byte pattern
-                         ;; once, then double the copied span each step.
-                         ;; Every REPLACE reads a region that ends before
-                         ;; its destination begins, so plain forward copying
-                         ;; is safe, and an O(LENGTH) scalar loop becomes
-                         ;; O(LOG) vector copies.
-                         (t
-                          (let ((done distance))
-                            (declare (type fixnum done))
-                            (replace buffer buffer
-                                     :start1 pos :start2 src
-                                     :end1 (+ pos done) :end2 (+ src done))
-                            (loop while (< done length)
-                                  do (let ((chunk (min done (- length done))))
-                                       (declare (type fixnum chunk))
-                                       (replace buffer buffer
-                                                :start1 (+ pos done)
-                                                :start2 pos
-                                                :end1 (+ pos done chunk)
-                                                :end2 (+ pos chunk))
-                                       (incf done chunk))))
-                           (incf pos length))))))))))))))))
+      (%with-inflate-tables (lit dist)
+        (loop
+          (%inflate-decode-one lroot lfast lcounts lfirst lsyms lidx sym)
+          (cond ((< sym 256)
+                 (multiple-value-bind (nbuffer nsize)
+                     (ensure-out-capacity buffer size pos 1)
+                   (setf buffer nbuffer size nsize)
+                   (setf (aref buffer pos) sym)
+                   (incf pos)))
+                ((= sym 256)
+                 (setf (br-accum reader) accum
+                       (br-nbits reader) nbits
+                       (br-pos reader) rpos)
+                 (return (values buffer pos size)))
+                (t (%emit-inflate-match))))))))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------
+
+(defun %read-cl-repeat (reader sym i total lengths)
+  "Apply code-length repeat SYM at index I of LENGTHS; returns the new I."
+  (declare (optimize (speed 3) (safety 0))
+           (type fixnum sym i total)
+           (type (simple-array fixnum (*)) lengths))
+  (labels ((fill-run (value rep)
+             (declare (type fixnum value rep))
+             (dotimes (k rep)
+               (declare (ignore k))
+               (when (>= i total)
+                 (error 'newzlib-format-error
+                        :detail "code length repeat overruns table"))
+               (setf (aref lengths i) value)
+               (incf i))))
+    (cond ((= sym 16)
+           (when (zerop i)
+             (error 'newzlib-format-error
+                    :detail "repeat code 16 with no previous length"))
+           (fill-run (aref lengths (1- i)) (+ (read-bits reader 2) 3)))
+          (t (fill-run 0 (+ (read-bits reader (if (= sym 17) 3 7))
+                            (if (= sym 17) 3 11))))))
+  i)
 
 (defun inflate-dynamic-header (reader)
   "Decode the dynamic block header, returning (VALUES LIT DIST) decode tables."
@@ -364,43 +386,18 @@ which is fine because the operation aborts."
         (setf (aref cl-lengths (aref +code-length-order+ i)) (read-bits reader 3)))
       (let ((cl-tree (build-huffman-decode-table cl-lengths))
             (lengths (make-array (+ hlit hdist) :element-type 'fixnum
-                                 :initial-element 0)))
-        (let ((i 0))
-          (declare (type fixnum i))
-          (iterate:iterate
-            (iterate:while (< i (+ hlit hdist)))
-            (let ((sym (huffman-decode cl-tree reader)))
-              (declare (type fixnum sym))
-              (cond
-                ((< sym 16)
-                 (setf (aref lengths i) sym)
-                 (incf i))
-                ((= sym 16)
-                 (when (zerop i)
-                   (error 'newzlib-format-error
-                          :detail "repeat code 16 with no previous length"))
-                 (let ((rep (+ (read-bits reader 2) 3)))
-                   (declare (type fixnum rep))
-                   (let ((prev (aref lengths (1- i))))
-                     (iterate:iterate (iterate:repeat rep)
-                       (when (>= i (+ hlit hdist))
-                         (error 'newzlib-format-error
-                                :detail "code length repeat overruns table"))
-                       (setf (aref lengths i) prev)
-                       (incf i)))))
-                ((or (= sym 17) (= sym 18))
-                 (let ((rep (+ (read-bits reader (if (= sym 17) 3 7))
-                               (if (= sym 17) 3 11))))
-                   (declare (type fixnum rep))
-                   (iterate:iterate (iterate:repeat rep)
-                     (when (>= i (+ hlit hdist))
-                       (error 'newzlib-format-error
-                              :detail "code length repeat overruns table"))
-                     (setf (aref lengths i) 0)
-                     (incf i))))
-                (t
-                 (error 'newzlib-format-error
-                        :detail "invalid code length code"))))))
+                                 :initial-element 0))
+            (total (+ hlit hdist))
+            (i 0))
+        (declare (type fixnum total i))
+        (loop while (< i total) do
+          (let ((sym (huffman-decode cl-tree reader)))
+            (declare (type fixnum sym))
+            (cond ((< sym 16) (setf (aref lengths i) sym) (incf i))
+                  ((<= 16 sym 18)
+                   (setf i (%read-cl-repeat reader sym i total lengths)))
+                  (t (error 'newzlib-format-error
+                            :detail "invalid code length code")))))
         (values (build-huffman-decode-table lengths 0 hlit)
                 (build-huffman-decode-table lengths hlit hdist))))))
 

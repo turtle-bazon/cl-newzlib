@@ -27,11 +27,23 @@ self-test); shorter inputs and the <32-byte tail always use %adler32.")
 ;;; NMAX analysis.
 (defconstant +adler-chunk+ 2048)
 
-(declaim (inline %adler32))
+(declaim (inline %adler32 %adler-tail))
+
+(defun %adler-tail (octets i end s1 s2)
+  "Scalar tail to END; returns (VALUES S1 S2)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) octets)
+           (type fixnum i end)
+           (type (unsigned-byte 32) s1 s2)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (loop while (< i end) do
+    (setf s1 (+ s1 (aref octets i))
+          s2 (+ s2 s1)
+          i (1+ i)))
+  (values s1 s2))
+
 (defun %adler32 (octets start end s1 s2)
   (declare (type (simple-array (unsigned-byte 8) (*)) octets)
-           (type fixnum start end)
-           (type (unsigned-byte 32) s1 s2)
+           (type fixnum start end) (type (unsigned-byte 32) s1 s2)
            (optimize (speed 3) (safety 0) (debug 0)))
   (let ((i start))
     (declare (type fixnum i))
@@ -40,8 +52,7 @@ self-test); shorter inputs and the <32-byte tail always use %adler32.")
             s2 (mod s2 +adler-mod+))
       (let ((chunk-end (min end (+ i +adler-chunk+))))
         (declare (type fixnum chunk-end))
-        ;; eight bytes at a time: all eight loads are independent, then two
-        ;; short dependency chains (s1, s2) that the CPU overlaps
+        ;; eight independent loads feed two short chains the CPU overlaps
         (let ((block-end (- chunk-end (mod (- chunk-end i) 8))))
           (declare (type fixnum block-end))
           (loop while (< i block-end) do
@@ -64,11 +75,9 @@ self-test); shorter inputs and the <32-byte tail always use %adler32.")
                     s1 (+ s1 b6) s2 (+ s2 s1)
                     s1 (+ s1 b7) s2 (+ s2 s1)
                     i (+ i 8)))))
-        ;; tail bytes
-        (loop while (< i chunk-end) do
-          (setf s1 (+ s1 (aref octets i))
-                s2 (+ s2 s1)
-                i (1+ i)))))
+        ;; tail bytes of this chunk
+        (multiple-value-bind (ns1 ns2) (%adler-tail octets i chunk-end s1 s2)
+          (setf s1 ns1 s2 ns2 i chunk-end))))
     (setf s1 (mod s1 +adler-mod+)
           s2 (mod s2 +adler-mod+))
     (logior (ash s2 16) s1)))

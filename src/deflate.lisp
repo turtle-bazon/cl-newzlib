@@ -119,91 +119,99 @@ like zlib's INSERT_STRING match_head)."
             (aref head h) pos)
       old)))
 
-(defmacro longest-match (input pos end first-res head prev max-chain nice good best-len)
-  "Find the longest match for the string starting at INPUT[POS], ignoring
-matches no longer than BEST-LEN (zlib seeds this with the pending lazy match
-length).  FIRST-RES is the chain head captured before POS was inserted (an
-absolute position, or #xFFFFFFFF for an empty bucket), so it never equals
-POS.  Expands to a form returning (VALUES LENGTH DISTANCE).  Overlapping
-matches are allowed (the byte being matched at POS+LEN is the byte DISTANCE
-positions back), so runs longer than the distance are handled.
+(declaim (inline %lm-limits %lm-candidate-ok-p %lm-extend %lm-bestpair-ok-p))
+#+(and sbcl cl-newzlib-le)
+(declaim (inline %lm-bestpair-sap))
 
-A macro rather than a function so the chain walk always expands inline at
-its two %LZ77-SEARCH call sites: no call/return or multiple-value
-plumbing per searched position, and the walk shares the caller's
-registers.  Arguments must be side-effect-free (all call sites pass
-variables or constants); each is evaluated exactly once.  HEAD is not
-evaluated (the walk only follows PREV links from FIRST-RES).
+(defun %lm-limits (pos end best good max-chain)
+  "Per-search bounds: extension cap, window floor, chain budget (quartered
+when the seed BEST already reaches GOOD, as in zlib).  The window floor
+may go negative early in the input then it simply never triggers."
+  (declare (optimize (speed 3) (safety 0))
+           (type fixnum pos end best good max-chain))
+  (values (min (- end pos) +max-match+)
+          (- pos +max-dist+)
+          (if (>= best good) (ash max-chain -2) max-chain)))
 
-The seed BEST-LEN is clamped to a minimum of 1: with a 0 seed the
-best-len-1 lookahead below would index -1 when the candidate sits at
-position 0 (C's longest_match reads window[-1] there -- harmless in C,
-a bounds error in checked Lisp).  Clamping is acceptance-identical
-because every extension is at least 2 bytes long, so (> LEN 0) and
-(> LEN 1) agree."
+(defun %lm-bestpair-ok-p (input pos cand best)
+  "Best-len pair equal (portable byte form)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum pos cand best))
+  (and (= (aref input (+ pos best)) (aref input (+ cand best)))
+       (= (aref input (+ pos best -1)) (aref input (+ cand best -1)))))
+
+#+(and sbcl cl-newzlib-le)
+(defun %lm-bestpair-sap (isap pos cand best)
+  "Best-len pair as one u16 compare per side (offsets BEST and BEST-1 are
+adjacent, so a single 16-bit load covers both bytes)."
+  (declare (optimize (speed 3) (safety 0))
+           (type sb-sys:system-area-pointer isap)
+           (type fixnum pos cand best))
+  (= (sb-sys:sap-ref-16 isap (+ pos best -1))
+     (sb-sys:sap-ref-16 isap (+ cand best -1))))
+
+(defun %lm-candidate-ok-p (input pos end cand best p0 p1 isap)
+  "Chain-candidate precheck with the best-len pair first (like C's
+longest_match): it rejects ~98% of candidates, so the leading-byte loads
+usually never execute.  ISAP is the pinned input SAP (SBCL only)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum pos end cand best p0 p1)
+           #-(and sbcl cl-newzlib-le) (ignore isap))
+  (and (< (+ pos best) end)
+       #+(and sbcl cl-newzlib-le) (%lm-bestpair-sap isap pos cand best)
+       #-(and sbcl cl-newzlib-le) (%lm-bestpair-ok-p input pos cand best)
+       (= p0 (aref input cand))
+       (= p1 (aref input (1+ cand)))))
+
+(defun %lm-extend (input pos cand limit)
+  "Full extension length from offset 2 via bulk compare (SIMD-backed; a
+scalar-first probe was tried and netted negative, so kept SIMD)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum pos cand limit))
+  (if (< 2 limit)
+      (+ 2 (leading-equal-octets input (+ pos 2) (+ cand 2) (- limit 2)))
+      2))
+
+(defmacro longest-match (input pos end first-res head prev max-chain nice good best-len isap)
+  "Longest match for INPUT[POS] over BEST-LEN (clamped >= 1 for the
+best-len-1 lookahead).  FIRST-RES is the pre-insert chain head
+(or #xFFFFFFFF; HEAD never evaluated); ISAP is the pinned input SAP
+(SBCL only, for the u16 best-pair check).  Expands to (VALUES LENGTH
+DISTANCE), inlining at both search sites; args side-effect-free."
   (let ((g-input (gensym "INPUT")) (g-pos (gensym "POS")) (g-end (gensym "END"))
-        (g-res (gensym "RES")) (g-prev (gensym "PREV"))
-        (g-max (gensym "MAX")) (g-nice (gensym "NICE")) (g-good (gensym "GOOD"))
-        (g-best (gensym "BEST")) (g-dist (gensym "DIST"))
-        (g-chain (gensym "CHAIN")) (g-limit (gensym "LIMIT"))
-        (g-window (gensym "WINDOW")) (g-p0 (gensym "P0")) (g-p1 (gensym "P1"))
-        (g-cand (gensym "CAND")) (g-len (gensym "LEN")))
+        (g-res (gensym "RES")) (g-prev (gensym "PREV")) (g-max (gensym "MAX"))
+        (g-nice (gensym "NICE")) (g-good (gensym "GOOD")) (g-best (gensym "BEST"))
+        (g-dist (gensym "DIST")) (g-chain (gensym "CHAIN")) (g-isap (gensym "ISAP"))
+        (g-p0 (gensym "P0")) (g-p1 (gensym "P1")) (g-cand (gensym "CAND")) (g-len (gensym "LEN")))
     `(let ((,g-input ,input) (,g-pos ,pos) (,g-end ,end) (,g-res ,first-res)
-           (,g-prev ,prev) (,g-max ,max-chain)
-           (,g-nice ,nice) (,g-good ,good) (,g-best (max ,best-len 1))
-           (,g-dist 0) (,g-chain 0))
+           (,g-prev ,prev) (,g-max ,max-chain) (,g-nice ,nice) (,g-good ,good)
+           (,g-best (max ,best-len 1)) (,g-dist 0) (,g-chain 0) (,g-isap ,isap))
        (declare (optimize (speed 3) (safety 0))
                 (type (simple-array (unsigned-byte 8) (*)) ,g-input)
                 (type (simple-array (unsigned-byte 32) (*)) ,g-prev)
                 (type fixnum ,g-pos ,g-end ,g-res ,g-max ,g-nice ,g-good
                       ,g-best ,g-dist ,g-chain))
-       ;; Both bounds depend only on POS/END, so they are computed once per
-       ;; call rather than once per chain candidate: MATCH-LIMIT caps
-       ;; extension length, WINDOW-LIMIT (possibly negative early in the
-       ;; input, which simply never triggers) ends the walk past the 32 KiB
-       ;; window with a single comparison.
-       (let ((,g-limit (min (- ,g-end ,g-pos) +max-match+))
-             (,g-window (- ,g-pos +max-dist+)))
-         (declare (type fixnum ,g-limit ,g-window))
-         (when (>= ,g-best ,g-good)
-           (setf ,g-max (ash ,g-max -2)))
-         ;; INPUT[POS..POS+1] never change across candidates, so hoist them
-         ;; out of the walk; only the best-len-dependent and candidate bytes
-         ;; stay inline.
-         (let ((,g-p0 (aref ,g-input ,g-pos))
-               (,g-p1 (aref ,g-input (1+ ,g-pos))))
+       (multiple-value-bind (limit window maxc)
+           (%lm-limits ,g-pos ,g-end ,g-best ,g-good ,g-max)
+         (declare (type fixnum limit window maxc))
+         (let ((,g-p0 (aref ,g-input ,g-pos)) (,g-p1 (aref ,g-input (1+ ,g-pos))))
            (declare (type fixnum ,g-p0 ,g-p1))
            (loop
-             ;; an empty bucket or a link past the window ends the walk
-             ;; immediately
-             (when (or (= ,g-res #xFFFFFFFF) (< ,g-res ,g-window))
+             (when (or (= ,g-res #xFFFFFFFF) (< ,g-res window)
+                       (>= ,g-chain maxc))
                (return))
-             (when (>= ,g-chain ,g-max) (return))
              (incf ,g-chain)
              (let ((,g-cand ,g-res))
                (declare (type fixnum ,g-cand))
-               (when (and (= ,g-p0 (aref ,g-input ,g-cand))
-                          (= ,g-p1 (aref ,g-input (1+ ,g-cand)))
-                          (< (+ ,g-pos ,g-best) ,g-end)
-                          (= (aref ,g-input (+ ,g-pos ,g-best))
-                             (aref ,g-input (+ ,g-cand ,g-best)))
-                          (= (aref ,g-input (+ ,g-pos ,g-best -1))
-                             (aref ,g-input (+ ,g-cand ,g-best -1))))
-                 ;; Bulk extension goes through LEADING-EQUAL-OCTETS
-                 ;; (SIMD-accelerated where available); the two leading bytes
-                 ;; were already verified above so comparison starts at 2.
-                 ;; (A scalar-first probe was tried: ~80% of extensions do
-                 ;; mismatch early, but the probe taxes long matches with
-                 ;; both probe and call, netting out negative.  Kept SIMD.)
-                 (let ((,g-len (if (< 2 ,g-limit)
-                                   (+ 2 (leading-equal-octets
-                                         ,g-input (+ ,g-pos 2) (+ ,g-cand 2)
-                                         (- ,g-limit 2)))
-                                   2)))
+               (when (%lm-candidate-ok-p ,g-input ,g-pos ,g-end ,g-cand
+                                         ,g-best ,g-p0 ,g-p1 ,g-isap)
+                 (let ((,g-len (%lm-extend ,g-input ,g-pos ,g-cand limit)))
                    (declare (type fixnum ,g-len))
                    (when (> ,g-len ,g-best)
-                     (setf ,g-best ,g-len
-                           ,g-dist (- ,g-pos ,g-cand))
+                     (setf ,g-best ,g-len ,g-dist (- ,g-pos ,g-cand))
                      (when (>= ,g-len ,g-nice) (return))))))
              (setf ,g-res (aref ,g-prev (logand ,g-res +window-mask+)))))
          (values ,g-best ,g-dist)))))
@@ -382,115 +390,137 @@ compression is fully deterministic across calls."
               (setf (aref prev (logand q +window-mask+)) (aref head h)
                     (aref head h) q)))))
 
-(defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
-                     sym dist el ed head prev lit-freq dist-freq)
-  "LZ77 tokenization core; see RUN-LZ77.  Returns (VALUES NSYM EXTRA-BITS)."
+(defmacro %lazy-drain-short ()
+  "No room to search: flush any pending match, emit the rest as literals.
+Leaves POS at END.  Uses the lazy loop's locals (see %LZ77-SEARCH-LAZY)."
+  `(progn
+     (when have-pending
+       (if (>= pending-len +min-match+)
+           (progn
+             (%emit-match pending-len pending-dist)
+             (setf pos (+ pending-pos pending-len)))
+           (progn
+             (%emit-literal pending-pos)
+             (setf pos (1+ pending-pos))))
+       (setf have-pending nil))
+     (loop while (< pos end) do
+       (%emit-literal pos)
+       (incf pos))))
+
+(defmacro %lazy-search-step ()
+  "Insert POS, search, and resolve the new match against the pending one.
+Uses the lazy loop's locals (see %LZ77-SEARCH-LAZY)."
+  `(let ((cand (insert-string input pos head prev)))
+     (declare (type fixnum cand))
+     (let ((mlen 0) (mdist 0))
+       (declare (type fixnum mlen mdist))
+       (when (and (/= cand #xFFFFFFFF)
+                  (or (not have-pending)
+                      (< pending-len max-lazy)))
+         (multiple-value-bind (len d)
+             (longest-match input pos end cand head prev
+                            max-chain nice good
+                            (if have-pending pending-len (1- +min-match+))
+                            isap)
+           (setf mlen len mdist d)))
+       (cond ((and have-pending
+                   (>= pending-len +min-match+)
+                   (<= mlen pending-len))
+              (%emit-match pending-len pending-dist)
+              (%insert-match-interior pending-pos pending-len (+ pending-pos 2))
+              (setf pos (+ pending-pos pending-len)
+                    have-pending nil))
+             (have-pending
+              (%emit-literal (1- pos))
+              (incf pos)
+              (setf pending-len mlen
+                    pending-dist mdist
+                    pending-pos (1- pos)))
+             (t (setf have-pending t
+                      pending-len mlen
+                      pending-dist mdist
+                      pending-pos pos)
+                (incf pos))))))
+
+(defun %lz77-search-lazy (input start end nice good max-chain max-lazy
+                           sym dist el ed head prev lit-freq dist-freq)
+  "Lazy matching (zlib deflate_slow): defer each match one position and
+adopt it only if no longer match starts on the next byte."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end nice good max-chain max-lazy))
-  (let ((nsym 0)
-        (extra-bits 0)
-        (pos start))
-    (declare (type fixnum nsym extra-bits pos))
-    (if lazy-p
-        ;; lazy matching: defer each match one position (zlib deflate_slow)
-        (let ((have-pending nil)
-              (pending-len 0)
-              (pending-dist 0)
-              (pending-pos 0))
-          (declare (type fixnum pending-len pending-dist pending-pos))
-          (loop while (< pos end) do
-            (if (< (- end pos) +min-match+)
-                ;; no room to search for a new match: flush any pending
-                ;; match and emit the remaining bytes as literals
-                (progn
-                  (when have-pending
-                    (if (>= pending-len +min-match+)
-                        (progn
-                          (%emit-match pending-len pending-dist)
-                          (setf pos (+ pending-pos pending-len)))
-                        (progn
-                          (%emit-literal pending-pos)
-                          (setf pos (1+ pending-pos))))
-                    (setf have-pending nil))
-                  (loop while (< pos end) do
-                    (%emit-literal pos)
-                    (incf pos)))
-                (progn
-                  (let ((cand (insert-string input pos head prev)))
-                    (declare (type fixnum cand))
-                    (let ((mlen 0) (mdist 0))
-                      (declare (type fixnum mlen mdist))
-                      (when (and (/= cand #xFFFFFFFF)
-                                 (or (not have-pending)
-                                     (< pending-len max-lazy)))
-                        (multiple-value-bind (len d)
-                            (longest-match input pos end cand head prev
-                                           max-chain nice good
-                                           (if have-pending
-                                               pending-len
-                                               (1- +min-match+)))
-                          (setf mlen len mdist d)))
-                      (cond
-                        ;; the pending match is at least as good: emit it
-                        ((and have-pending
-                              (>= pending-len +min-match+)
-                              (<= mlen pending-len))
-                         (%emit-match pending-len pending-dist)
-                         (%insert-match-interior pending-pos pending-len
-                                                 (+ pending-pos 2))
-                         (setf pos (+ pending-pos pending-len)
-                               have-pending nil))
-                        ;; there is a pending position: output its byte as a
-                        ;; literal, keep the current (longer) match pending
-                        (have-pending
-                         (%emit-literal (1- pos))
-                         (incf pos)
-                         (setf pending-len mlen
-                               pending-dist mdist
-                               pending-pos (1- pos)))
-                        ;; nothing pending: wait for the next step to decide
-                        (t
-                         (setf have-pending t
-                               pending-len mlen
-                               pending-dist mdist
-                               pending-pos pos)
-                         (incf pos))))))))
-          ;; flush any pending match at end of input
-          (when have-pending
-            (if (>= pending-len +min-match+)
-                (%emit-match pending-len pending-dist)
-                (%emit-literal pending-pos))))
-        ;; greedy matching (zlib deflate_fast)
-        (loop while (< pos end) do
-          (if (< (- end pos) +min-match+)
-              (progn
-                (%emit-literal pos)
-                (incf pos))
-              (progn
-                (let ((cand (insert-string input pos head prev)))
-                  (declare (type fixnum cand))
-                  (if (= cand #xFFFFFFFF)
-                      ;; empty bucket: no candidate, emit a literal
-                      (progn
-                        (%emit-literal pos)
-                        (incf pos))
-                      (multiple-value-bind (len d)
-                          (longest-match input pos end cand head prev
-                                         max-chain nice good (1- +min-match+))
-                        (if (>= len +min-match+)
-                            (progn
-                              (%emit-match len d)
-                              (when (<= len max-lazy)
-                                (%insert-match-interior pos len (1+ pos)))
-                              (incf pos len))
-                            (progn
-                              (%emit-literal pos)
-                              (incf pos))))))))))
+  (let ((nsym 0) (extra-bits 0) (pos start)
+        (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0))
+    (declare (type fixnum nsym extra-bits pos pending-len pending-dist pending-pos))
+    ;; Pin the input for the walk so the u16 best-pair check loads words
+    ;; with one SAP taken once (output growth never moves INPUT).
+    (with-pinned-input (isap input)
+      (loop while (< pos end) do
+        (if (< (- end pos) +min-match+)
+            (%lazy-drain-short)
+            (%lazy-search-step))))
+    (when have-pending
+      (if (>= pending-len +min-match+)
+          (%emit-match pending-len pending-dist)
+          (%emit-literal pending-pos)))
     (values nsym extra-bits)))
+
+(defun %lz77-search-greedy (input start end nice good max-chain max-lazy
+                             sym dist el ed head prev lit-freq dist-freq)
+  "Greedy matching (zlib deflate_fast) for levels 1-3."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
+           (type (simple-array fixnum (*)) lit-freq dist-freq)
+           (type fixnum start end nice good max-chain max-lazy))
+  (let ((nsym 0) (extra-bits 0) (pos start))
+    (declare (type fixnum nsym extra-bits pos))
+    (with-pinned-input (isap input)
+      (loop while (< pos end) do
+        (if (< (- end pos) +min-match+)
+            (progn
+              (%emit-literal pos)
+              (incf pos))
+            (let ((cand (insert-string input pos head prev)))
+              (declare (type fixnum cand))
+              (if (= cand #xFFFFFFFF)
+                  (progn
+                    (%emit-literal pos)
+                    (incf pos))
+                  (multiple-value-bind (len d)
+                      (longest-match input pos end cand head prev
+                                     max-chain nice good (1- +min-match+)
+                                     isap)
+                    (if (>= len +min-match+)
+                        (progn
+                          (%emit-match len d)
+                          (when (<= len max-lazy)
+                            (%insert-match-interior pos len (1+ pos)))
+                          (incf pos len))
+                        (progn
+                          (%emit-literal pos)
+                          (incf pos)))))))))
+    (values nsym extra-bits)))
+
+(defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
+                     sym dist el ed head prev lit-freq dist-freq)
+  "LZ77 tokenization core; see RUN-LZ77.  Returns (VALUES NSYM EXTRA-BITS).
+Dispatches to the lazy (levels 4-9) or greedy (levels 1-3) worker."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
+           (type (simple-array fixnum (*)) lit-freq dist-freq)
+           (type fixnum start end nice good max-chain max-lazy))
+  (if lazy-p
+      (%lz77-search-lazy input start end nice good max-chain max-lazy
+                         sym dist el ed head prev lit-freq dist-freq)
+      (%lz77-search-greedy input start end nice good max-chain max-lazy
+                           sym dist el ed head prev lit-freq dist-freq)))
 
 (defun run-lz77 (input start end level sym dist el ed lit-freq dist-freq
                  &optional (head (make-array +hash-size+
@@ -592,6 +622,30 @@ bytes per block."
       (replace buf input :start1 pos :start2 start :end1 (+ pos len) :end2 end)
       (setf (bw-pos writer) (+ pos len)))))
 
+(declaim (inline %emit-coded-token))
+
+(defun %emit-coded-token (writer s dd el-i ed-i lit-codes lit-lengths
+                          dist-codes dist-lengths)
+  "Write token S (literal or length code) with distance code DD: the literal
+code, then for matches the length extra, distance code and distance extra."
+  (declare (optimize (speed 3) (safety 0))
+           (type fixnum s dd el-i ed-i)
+           (type (simple-array fixnum (*)) lit-codes lit-lengths
+                 dist-codes dist-lengths))
+  (write-bits writer (aref lit-codes s) (aref lit-lengths s))
+  (when (> s 256)
+    (let* ((be (length-base+extra (- s 257)))
+           (n (ash be -16)))
+      (declare (type (unsigned-byte 32) be) (type fixnum n))
+      (when (plusp n)
+        (write-bits writer (- el-i (logand be #xFFFF)) n)))
+    (let* ((bde (dist-base+extra dd))
+           (dn (ash bde -16)))
+      (declare (type fixnum dn) (type (unsigned-byte 32) bde))
+      (write-bits writer (aref dist-codes dd) (aref dist-lengths dd))
+      (when (plusp dn)
+        (write-bits writer (- ed-i (logand bde #xFFFF)) dn)))))
+
 (defun emit-fixed-block (writer sym dist el ed nsym bfinal)
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
@@ -600,24 +654,10 @@ bytes per block."
   (write-bits writer (if bfinal 1 0) 1)
   (write-bits writer 1 2)
   (loop for i below nsym do
-    (let ((s (aref sym i)))
-      (write-bits writer (aref +static-lit-codes+ s)
-                  (aref +static-lit-lengths+ s))
-      (when (> s 256)
-        (let* ((be (length-base+extra (- s 257)))
-               (n (ash be -16)))
-          (declare (type (unsigned-byte 32) be)
-                   (type fixnum n))
-          (when (plusp n)
-            (write-bits writer (- (aref el i) (logand be #xFFFF)) n))
-          (let* ((dd (aref dist i))
-                 (bde (dist-base+extra dd))
-                 (dn (ash bde -16)))
-            (declare (type fixnum dd dn)
-                     (type (unsigned-byte 32) bde))
-            (write-bits writer (aref +static-dist-codes+ dd) 5)
-            (when (plusp dn)
-              (write-bits writer (- (aref ed i) (logand bde #xFFFF)) dn))))))))
+    (%emit-coded-token writer (aref sym i) (aref dist i)
+                       (aref el i) (aref ed i)
+                       +static-lit-codes+ +static-lit-lengths+
+                       +static-dist-codes+ +static-dist-lengths+)))
 
 (defun data-bits (sym dist nsym len-array dist-len-array extra-bits)
   "Total coded bits for the token stream, plus the accumulated EXTRA-BITS."
@@ -658,6 +698,61 @@ size estimates in a single pass over the tokens."
             (incf fixed (aref dist-fixed-lens d))))))
     (values dyn fixed)))
 
+(declaim (inline %bl-run-limits %bl-push-verbatim %bl-push-repeat
+                 %bl-push-zeros))
+
+(defun %bl-run-limits (curlen nextlen)
+  "Count bounds for the run ending here: (VALUES MAX-COUNT MIN-COUNT)."
+  (declare (type fixnum curlen nextlen))
+  (cond ((zerop nextlen) (values 138 3))
+        ((= curlen nextlen) (values 6 3))
+        (t (values 7 4))))
+
+(defun %bl-push-verbatim (bl-sym bl-extra bl-freq nbl curlen count)
+  "Append COUNT literal code-length symbols; returns the new NBL."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array fixnum (*)) bl-sym bl-extra bl-freq)
+           (type fixnum nbl curlen count))
+  (dotimes (k count nbl)
+    (declare (ignore k))
+    (setf (aref bl-sym nbl) curlen
+          (aref bl-extra nbl) 0)
+    (incf (aref bl-freq curlen))
+    (incf nbl)))
+
+(defun %bl-push-repeat (bl-sym bl-extra bl-freq nbl curlen count prevlen)
+  "Append a code-16 repeat of the previous length; returns (VALUES NBL 2)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array fixnum (*)) bl-sym bl-extra bl-freq)
+           (type fixnum nbl curlen count prevlen))
+  (when (/= curlen prevlen)
+    (setf (aref bl-sym nbl) curlen
+          (aref bl-extra nbl) 0)
+    (incf (aref bl-freq curlen))
+    (incf nbl)
+    (decf count))
+  (setf (aref bl-sym nbl) 16
+        (aref bl-extra nbl) (- count 3))
+  (incf (aref bl-freq 16))
+  (values (1+ nbl) 2))
+
+(defun %bl-push-zeros (bl-sym bl-extra bl-freq nbl count)
+  "Append a code-17/18 zero run; returns (VALUES NBL EXTRA-BITS)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array fixnum (*)) bl-sym bl-extra bl-freq)
+           (type fixnum nbl count))
+  (if (<= count 10)
+      (progn
+        (setf (aref bl-sym nbl) 17
+              (aref bl-extra nbl) (- count 3))
+        (incf (aref bl-freq 17))
+        (values (1+ nbl) 3))
+      (progn
+        (setf (aref bl-sym nbl) 18
+              (aref bl-extra nbl) (- count 11))
+        (incf (aref bl-freq 18))
+        (values (1+ nbl) 7))))
+
 (defun scan-code-lengths (lengths n bl-sym bl-extra bl-freq nbl)
   "RLE-encode LENGTHS[0..N) into code-length symbols (RFC 1951 3.2.7),
 appending to BL-SYM/BL-EXTRA starting at NBL and counting frequencies into
@@ -665,57 +760,63 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array fixnum (*)) lengths bl-sym bl-extra bl-freq)
            (type fixnum n nbl))
-  (let ((count 0)
-        (prevlen -1)
-        (extra-bits 0))
+  (let ((count 0) (prevlen -1) (extra-bits 0))
     (declare (type fixnum count prevlen extra-bits))
-    (let ((nextlen (if (plusp n) (aref lengths 0) -1))
-          (max-count 7)
-          (min-count 4))
-      (declare (type fixnum nextlen max-count min-count))
-      (when (zerop nextlen) (setf max-count 138 min-count 3))
-      (iterate:iterate
-        (iterate:for idx from 0 below n)
-        (iterate:for curlen = nextlen)
-        (setf nextlen (if (< idx (1- n)) (aref lengths (1+ idx)) -1))
-        (incf count)
-        (unless (and (< count max-count) (= curlen nextlen))
-          (cond
-            ((< count min-count)
-             (iterate:iterate (iterate:repeat count)
-               (setf (aref bl-sym nbl) curlen
-                     (aref bl-extra nbl) 0)
-               (incf (aref bl-freq curlen))
-               (incf nbl)))
-            ((not (zerop curlen))
-             (when (/= curlen prevlen)
-               (setf (aref bl-sym nbl) curlen
-                     (aref bl-extra nbl) 0)
-               (incf (aref bl-freq curlen))
-               (incf nbl)
-               (decf count))
-             (setf (aref bl-sym nbl) 16
-                   (aref bl-extra nbl) (- count 3))
-             (incf (aref bl-freq 16))
-             (incf extra-bits 2)
-             (incf nbl))
-            ((<= count 10)
-             (setf (aref bl-sym nbl) 17
-                   (aref bl-extra nbl) (- count 3))
-             (incf (aref bl-freq 17))
-             (incf extra-bits 3)
-             (incf nbl))
-            (t
-             (setf (aref bl-sym nbl) 18
-                   (aref bl-extra nbl) (- count 11))
-             (incf (aref bl-freq 18))
-             (incf extra-bits 7)
-             (incf nbl)))
-          (setf count 0 prevlen curlen)
-          (cond ((zerop nextlen) (setf max-count 138 min-count 3))
-                ((= curlen nextlen) (setf max-count 6 min-count 3))
-                (t (setf max-count 7 min-count 4)))))
+    (let ((nextlen (if (plusp n) (aref lengths 0) -1)))
+      (declare (type fixnum nextlen))
+      (multiple-value-bind (max-count min-count)
+          (if (zerop nextlen) (values 138 3) (values 7 4))
+        (declare (type fixnum max-count min-count))
+        (iterate:iterate
+          (iterate:for idx from 0 below n)
+          (iterate:for curlen = nextlen)
+          (setf nextlen (if (< idx (1- n)) (aref lengths (1+ idx)) -1))
+          (incf count)
+          (unless (and (< count max-count) (= curlen nextlen))
+            (cond ((< count min-count)
+                   (setf nbl (%bl-push-verbatim bl-sym bl-extra bl-freq
+                                                nbl curlen count)))
+                  ((not (zerop curlen))
+                   (multiple-value-bind (nn eb)
+                       (%bl-push-repeat bl-sym bl-extra bl-freq
+                                        nbl curlen count prevlen)
+                     (setf nbl nn)
+                     (incf extra-bits eb)))
+                  (t (multiple-value-bind (nn eb)
+                         (%bl-push-zeros bl-sym bl-extra bl-freq nbl count)
+                       (setf nbl nn)
+                       (incf extra-bits eb))))
+            (setf count 0 prevlen curlen)
+            (multiple-value-bind (mx mn) (%bl-run-limits curlen nextlen)
+              (setf max-count mx min-count mn)))))
       (values nbl extra-bits))))
+
+(declaim (inline %emit-bl-header %emit-bl-symbols))
+
+(defun %emit-bl-header (writer bfinal hlit hdist hclen)
+  "Write a dynamic block's 3-bit type plus HLIT/HDIST/HCLEN counts."
+  (declare (type fixnum hlit hdist hclen))
+  (write-bits writer (if bfinal 1 0) 1)
+  (write-bits writer 2 2)
+  (write-bits writer (- hlit 257) 5)
+  (write-bits writer (- hdist 1) 5)
+  (write-bits writer (- hclen 4) 4))
+
+(defun %emit-bl-symbols (writer bl-sym bl-extra bl-codes bl-lengths nbl hclen)
+  "Write the code-length order table then the NBL code-length symbols."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array fixnum (*)) bl-sym bl-extra bl-codes bl-lengths)
+           (type fixnum nbl hclen))
+  (loop for i below hclen do
+    (write-bits writer (aref bl-lengths (aref +code-length-order+ i)) 3))
+  (loop for i below nbl do
+    (let ((s (aref bl-sym i)))
+      (write-bits writer (aref bl-codes s) (aref bl-lengths s))
+      (case s
+        (16 (write-bits writer (aref bl-extra i) 2))
+        (17 (write-bits writer (aref bl-extra i) 3))
+        (18 (write-bits writer (aref bl-extra i) 7))
+        (otherwise nil)))))
 
 (defun emit-dynamic-block (writer sym dist el ed nsym bfinal
                             lit-codes lit-lengths dist-codes dist-lengths
@@ -726,39 +827,12 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
            (type (simple-array fixnum (*)) lit-codes lit-lengths dist-codes
                               dist-lengths bl-sym bl-extra bl-codes bl-lengths)
            (type fixnum nsym nbl hlit hdist hclen))
-  (write-bits writer (if bfinal 1 0) 1)
-  (write-bits writer 2 2)
-  (write-bits writer (- hlit 257) 5)
-  (write-bits writer (- hdist 1) 5)
-  (write-bits writer (- hclen 4) 4)
-  (loop for i below hclen do
-    (write-bits writer (aref bl-lengths (aref +code-length-order+ i)) 3))
-  (loop for i below nbl do
-    (let ((s (aref bl-sym i)))
-      (write-bits writer (aref bl-codes s) (aref bl-lengths s))
-      (case s
-        (16 (write-bits writer (aref bl-extra i) 2))
-        (17 (write-bits writer (aref bl-extra i) 3))
-        (18 (write-bits writer (aref bl-extra i) 7))
-        (otherwise nil))))
+  (%emit-bl-header writer bfinal hlit hdist hclen)
+  (%emit-bl-symbols writer bl-sym bl-extra bl-codes bl-lengths nbl hclen)
   (loop for i below nsym do
-    (let ((s (aref sym i)))
-      (write-bits writer (aref lit-codes s) (aref lit-lengths s))
-      (when (> s 256)
-        (let* ((be (length-base+extra (- s 257)))
-               (n (ash be -16)))
-          (declare (type (unsigned-byte 32) be)
-                   (type fixnum n))
-          (when (plusp n)
-            (write-bits writer (- (aref el i) (logand be #xFFFF)) n)))
-        (let* ((dd (aref dist i))
-               (bde (dist-base+extra dd))
-               (dn (ash bde -16)))
-          (declare (type fixnum dd dn)
-                   (type (unsigned-byte 32) bde))
-          (write-bits writer (aref dist-codes dd) (aref dist-lengths dd))
-          (when (plusp dn)
-            (write-bits writer (- (aref ed i) (logand bde #xFFFF)) dn)))))))
+    (%emit-coded-token writer (aref sym i) (aref dist i)
+                       (aref el i) (aref ed i)
+                       lit-codes lit-lengths dist-codes dist-lengths)))
 
 ;;; ------------------------------------------------------------------
 ;;; Compressor driver
@@ -775,12 +849,116 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
         (bw-nbits writer) 0)
   writer)
 
+(defun %emit-tiny-choice (writer input start end n nsym extra-bits scratch)
+  "Stored-vs-fixed choice for inputs of at most 1024 bytes (dynamic trees
+rarely pay for themselves at that size)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end n nsym extra-bits))
+  (let ((stored-size (stored-block-bits writer n))
+        (fixed-size (+ 3 (data-bits (lzs-sym scratch) (lzs-distc scratch)
+                                    nsym +static-lit-lengths+
+                                    +static-dist-lengths+ extra-bits))))
+    (declare (type fixnum stored-size fixed-size))
+    (ensure-static-trees)
+    (if (<= stored-size fixed-size)
+        (emit-stored-blocks writer input start end)
+        (emit-fixed-block writer (lzs-sym scratch) (lzs-distc scratch)
+                          (lzs-el scratch) (lzs-ed scratch) nsym t))))
+
+(defun %span-of-used (lengths hi lo floor)
+  "One plus the highest used index in LENGTHS[LO..HI], at least FLOOR."
+  (declare (type (simple-array fixnum (*)) lengths)
+           (type fixnum hi lo floor))
+  (max floor (1+ (loop for i from hi downto lo
+                       when (plusp (aref lengths i)) return i))))
+
+(defun %plan-bl-trees (scratch lit-lengths hlit dist-lengths hdist)
+  "Scan lit/dist lengths and build the code-length tree.  Returns (VALUES
+NBL BL-EXTRA HCLEN BL-CODE-BITS)."
+  (declare (type fixnum hlit hdist))
+  (multiple-value-bind (nbl1 bl-extra1)
+      (scan-code-lengths lit-lengths hlit
+                         (lzs-bl-sym scratch) (lzs-bl-extra scratch)
+                         (lzs-bl-freq scratch) 0)
+    (declare (ignore bl-extra1))
+    (multiple-value-bind (nbl bl-extra)
+        (scan-code-lengths dist-lengths hdist
+                           (lzs-bl-sym scratch) (lzs-bl-extra scratch)
+                           (lzs-bl-freq scratch) nbl1)
+      (multiple-value-bind (bl-lengths bl-codes bl-max)
+          (build-huffman-codes (lzs-bl-freq scratch) 19 7
+                               (lzs-work scratch)
+                               (lzs-bl-lengths scratch) (lzs-bl-codes scratch))
+        (declare (ignore bl-codes bl-max))
+        (let ((hclen 4) (bl-code-bits 0))
+          (declare (type fixnum hclen bl-code-bits))
+          (loop for rank from 18 downto 3
+                when (plusp (aref bl-lengths (aref +code-length-order+ rank)))
+                do (setf hclen (1+ rank)) (return))
+          (loop for i below nbl do
+            (incf bl-code-bits (aref bl-lengths (aref (lzs-bl-sym scratch) i))))
+          (values nbl bl-extra hclen bl-code-bits))))))
+
+(defun %emit-cheapest (writer input start end scratch nsym
+                       opt-size fixed-size stored-size
+                       lit-codes lit-lengths dist-codes dist-lengths
+                       nbl hlit hdist hclen)
+  "Emit the cheapest of stored / fixed / dynamic for a large block."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end nsym opt-size fixed-size stored-size
+                   nbl hlit hdist hclen))
+  (cond ((<= stored-size (min opt-size fixed-size))
+         (emit-stored-blocks writer input start end))
+        ((<= fixed-size opt-size)
+         (emit-fixed-block writer (lzs-sym scratch) (lzs-distc scratch)
+                           (lzs-el scratch) (lzs-ed scratch) nsym t))
+        (t (emit-dynamic-block writer (lzs-sym scratch) (lzs-distc scratch)
+                               (lzs-el scratch) (lzs-ed scratch) nsym t
+                               lit-codes lit-lengths dist-codes dist-lengths
+                               (lzs-bl-sym scratch) (lzs-bl-extra scratch)
+                               (lzs-bl-codes scratch) (lzs-bl-lengths scratch)
+                               nbl hlit hdist hclen))))
+
+(defun %emit-optimized-block (writer input start end n nsym extra-bits scratch)
+  "Full dynamic-tree planning plus cheapest-encoding emit for large inputs."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end n nsym extra-bits))
+  (multiple-value-bind (lit-lengths lit-codes lit-max)
+      (build-huffman-codes (lzs-lit-freq scratch) 286 15
+                           (lzs-work scratch)
+                           (lzs-lit-lengths scratch) (lzs-lit-codes scratch))
+    (declare (ignore lit-max))
+    (multiple-value-bind (dist-lengths dist-codes dist-max)
+        (build-huffman-codes (lzs-dist-freq scratch) 30 15
+                             (lzs-work scratch)
+                             (lzs-dist-lengths scratch) (lzs-dist-codes scratch))
+      (declare (ignore dist-max))
+      (let ((hlit (%span-of-used lit-lengths 285 256 257))
+            (hdist (%span-of-used dist-lengths 29 0 1)))
+        (declare (type fixnum hlit hdist))
+        (multiple-value-bind (nbl bl-extra hclen bl-code-bits)
+            (%plan-bl-trees scratch lit-lengths hlit dist-lengths hdist)
+          (declare (type fixnum nbl bl-extra hclen bl-code-bits))
+          (ensure-static-trees)
+          (multiple-value-bind (dyn-bits fixed-bits)
+              (data-bits/dynamic-and-fixed
+               (lzs-sym scratch) (lzs-distc scratch) nsym
+               lit-lengths +static-lit-lengths+
+               dist-lengths +static-dist-lengths+ extra-bits)
+            (declare (type fixnum dyn-bits fixed-bits))
+            (%emit-cheapest writer input start end scratch nsym
+                            (+ 3 14 (* 3 hclen) bl-extra bl-code-bits dyn-bits)
+                            (+ 3 fixed-bits) (stored-block-bits writer n)
+                            lit-codes lit-lengths dist-codes dist-lengths
+                            nbl hlit hdist hclen)))))))
+
 (defun deflate-into-writer (input start end writer level)
   "Compress INPUT[START,END) into WRITER as one DEFLATE stream.  Level 0
 emits stored blocks; higher levels pick the cheapest block encoding."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end level))
   (let ((n (- end start)))
+    (declare (type fixnum n))
     (if (zerop level)
         (emit-stored-blocks writer input start end)
         (let ((scratch (acquire-lz77-scratch (1+ n))))
@@ -789,108 +967,18 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                  (fill (lzs-lit-freq scratch) 0)
                  (fill (lzs-dist-freq scratch) 0)
                  (fill (lzs-bl-freq scratch) 0)
-                  (multiple-value-bind (nsym extra-bits)
-                      (run-lz77 input start end level
-                                (lzs-sym scratch) (lzs-distc scratch)
-                                (lzs-el scratch) (lzs-ed scratch)
-                                (lzs-lit-freq scratch) (lzs-dist-freq scratch)
-                                (lzs-head scratch) (lzs-prev scratch))
-                    (if (<= n 1024)
-                        ;; Tiny input: dynamic Huffman trees rarely pay for
-                        ;; their construction cost here, so pick between the
-                        ;; two encodings that need no tree building.
-                        (let ((stored-size (stored-block-bits writer n))
-                              (fixed-size (+ 3 (data-bits (lzs-sym scratch)
-                                                          (lzs-distc scratch)
-                                                          nsym
-                                                          +static-lit-lengths+
-                                                          +static-dist-lengths+
-                                                          extra-bits))))
-                          (ensure-static-trees)
-                          (if (<= stored-size fixed-size)
-                              (emit-stored-blocks writer input start end)
-                              (emit-fixed-block writer (lzs-sym scratch)
-                                                (lzs-distc scratch)
-                                                (lzs-el scratch) (lzs-ed scratch)
-                                                nsym t)))
-                        (multiple-value-bind (lit-lengths lit-codes lit-max)
-                            (build-huffman-codes (lzs-lit-freq scratch) 286 15
-                                                 (lzs-work scratch)
-                                                 (lzs-lit-lengths scratch)
-                                                 (lzs-lit-codes scratch))
-                     (declare (ignore lit-max))
-                     (multiple-value-bind (dist-lengths dist-codes dist-max)
-                         (build-huffman-codes (lzs-dist-freq scratch) 30 15
-                                              (lzs-work scratch)
-                                              (lzs-dist-lengths scratch)
-                                              (lzs-dist-codes scratch))
-                       (declare (ignore dist-max))
-                       (let ((hlit (max 257 (1+ (loop for i from 285 downto 256
-                                                    when (plusp (aref lit-lengths i))
-                                                    return i))))
-                             (hdist (max 1 (1+ (loop for i from 29 downto 0
-                                                   when (plusp (aref dist-lengths i))
-                                                   return i)))))
-                         (multiple-value-bind (nbl1 bl-extra1)
-                             (scan-code-lengths lit-lengths hlit
-                                                (lzs-bl-sym scratch)
-                                                (lzs-bl-extra scratch)
-                                                (lzs-bl-freq scratch) 0)
-                           (declare (ignore bl-extra1))
-                           (multiple-value-bind (nbl2 bl-extra2)
-                               (scan-code-lengths dist-lengths hdist
-                                                  (lzs-bl-sym scratch)
-                                                  (lzs-bl-extra scratch)
-                                                  (lzs-bl-freq scratch) nbl1)
-                             (multiple-value-bind (bl-lengths bl-codes bl-max)
-                                 (build-huffman-codes (lzs-bl-freq scratch) 19 7
-                                                      (lzs-work scratch)
-                                                      (lzs-bl-lengths scratch)
-                                                      (lzs-bl-codes scratch))
-                               (declare (ignore bl-max))
-                               (let ((hclen 4))
-                                 (declare (type fixnum hclen))
-                                 (loop for rank from 18 downto 3
-                                       when (plusp (aref bl-lengths
-                                                        (aref +code-length-order+ rank)))
-                                       do (setf hclen (1+ rank))
-                                       (return))
-                                 (let ((bl-code-bits 0))
-                                   (declare (type fixnum bl-code-bits))
-                                    (loop for i below nbl2 do
-                                      (incf bl-code-bits
-                                            (aref bl-lengths
-                                                  (aref (lzs-bl-sym scratch) i))))
-                                   (ensure-static-trees)
-                                   (multiple-value-bind (dyn-bits fixed-bits)
-                                       (data-bits/dynamic-and-fixed
-                                        (lzs-sym scratch) (lzs-distc scratch) nsym
-                                        lit-lengths +static-lit-lengths+
-                                        dist-lengths +static-dist-lengths+
-                                        extra-bits)
-                                     (declare (ignorable dyn-bits fixed-bits))
-                                     (let ((opt-size (+ 3 14 (* 3 hclen) bl-extra2 bl-code-bits dyn-bits))
-                                         (fixed-size (+ 3 fixed-bits))
-                                         (stored-size (stored-block-bits writer n)))
-                                     (cond
-                                       ((<= stored-size (min opt-size fixed-size))
-                                        (emit-stored-blocks writer input start end))
-                                       ((<= fixed-size opt-size)
-                                        (emit-fixed-block writer (lzs-sym scratch)
-                                                          (lzs-distc scratch)
-                                                          (lzs-el scratch) (lzs-ed scratch)
-                                                          nsym t))
-                                       (t
-                                        (emit-dynamic-block writer (lzs-sym scratch)
-                                                            (lzs-distc scratch)
-                                                            (lzs-el scratch) (lzs-ed scratch)
-                                                            nsym t
-                                                            lit-codes lit-lengths
-                                                            dist-codes dist-lengths
-                                                            (lzs-bl-sym scratch)
-                                                            (lzs-bl-extra scratch)
-                                                            bl-codes bl-lengths
-                                                            nbl2 hlit hdist hclen))))))))))))))))
+                 (multiple-value-bind (nsym extra-bits)
+                     (run-lz77 input start end level
+                               (lzs-sym scratch) (lzs-distc scratch)
+                               (lzs-el scratch) (lzs-ed scratch)
+                               (lzs-lit-freq scratch) (lzs-dist-freq scratch)
+                               (lzs-head scratch) (lzs-prev scratch))
+                   (declare (type fixnum nsym extra-bits))
+                   (if (<= n 1024)
+                       (%emit-tiny-choice writer input start end
+                                          n nsym extra-bits scratch)
+                       (%emit-optimized-block writer input start end
+                                              n nsym extra-bits scratch))))
             (release-lz77-scratch scratch))))))
 
 (defun deflate-raw (input &optional (start 0) (end (length input)) (level 6))

@@ -82,6 +82,47 @@
       (replace new buffer :end2 size)
       (values new new-size))))
 
+;;; Reusable output scratch (gamedev-style pool): decoding into a retained
+;;; buffer skips the per-call growth chain (allocs, copies, and the large
+;;; transient that trips the large-object allocator); only the exact-size
+;;; result is freshly allocated per call.  Uses WITH-SCRATCH-LOCK from
+;;; deflate.lisp (which loads before this file); the pool never hands out
+;;; the same buffer twice (checked out until released), so sharing is safe.
+
+(defparameter *output-pool-max* 4
+  "Maximum idle scratch buffers retained.")
+
+(defparameter *output-pool-max-retain* 16777216
+  "Scratch buffers above this size are dropped instead of retained.")
+
+(defvar *output-pool* '()
+  "Idle reusable output octet vectors.")
+
+(defconstant +inflate-start-size+ 65536
+  "First-call scratch size: nursery-cheap, big enough to skip the small
+growth steps; steady state reuses high-water buffers anyway.")
+
+(defun acquire-output-buffer ()
+  "Check out a scratch octet vector (>= +INFLATE-START-SIZE+ bytes)."
+  (let ((found nil))
+    (with-scratch-lock
+      (let ((keep '()))
+        (dolist (v *output-pool*)
+          (if (and (not found) (>= (length v) +inflate-start-size+))
+              (setf found v)
+              (push v keep)))
+        (setf *output-pool* keep)))
+    (or found (make-octet-buffer +inflate-start-size+))))
+
+(defun release-output-buffer (buffer)
+  "Return scratch BUFFER to the pool (dropped when overfull/oversize)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer))
+  (with-scratch-lock
+    (when (and (< (length *output-pool*) *output-pool-max*)
+               (<= (length buffer) *output-pool-max-retain*))
+      (push buffer *output-pool*)))
+  nil)
+
 ;;; ------------------------------------------------------------------
 ;;; Stored blocks
 ;;; ------------------------------------------------------------------
@@ -458,18 +499,24 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
 
 (defun inflate-raw (input &optional (start 0) (end (length input)))
   "Decompress a raw DEFLATE stream INPUT[START,END).  Returns a fresh
-  octet vector."
+  octet vector; decoding runs in a pooled scratch buffer (only the
+  exact-size result is allocated per call)."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
   (let ((reader (make-bit-reader input start end))
-        (size 1024)
+        (buffer (acquire-output-buffer))
         (pos 0))
-    (declare (type fixnum size pos))
-    (let ((buffer (make-octet-buffer size)))
-      (multiple-value-bind (buffer pos)
-          (inflate-blocks reader buffer size pos)
-        (let ((result (make-octet-buffer pos)))
-          (replace result buffer :end2 pos)
-          result)))))
+    (declare (type fixnum pos)
+             (type (simple-array (unsigned-byte 8) (*)) buffer))
+    (let ((size (length buffer)))
+      (declare (type fixnum size))
+      (unwind-protect
+           (multiple-value-bind (nbuffer npos)
+               (inflate-blocks reader buffer size pos)
+             (setf buffer nbuffer)
+             (let ((result (make-octet-buffer npos)))
+               (replace result nbuffer :end2 npos)
+               result))
+        (release-output-buffer buffer)))))

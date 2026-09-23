@@ -65,13 +65,22 @@
            (type fixnum size pos need))
   (if (<= (+ pos need) size)
       (values buffer size)
-      ;; grow 4x at a time: repeated doubling spends ~1x of the final size
-      ;; in copied bytes, 4x growth spends ~1/3x
-      (let ((new-size size))
-        (loop while (< new-size (+ pos need)) do (setf new-size (* 4 new-size)))
-        (let ((new (make-octet-buffer new-size)))
-          (replace new buffer :end2 size)
-          (values new new-size)))))
+      (%grow-out-buffer buffer size pos need)))
+
+(defun %grow-out-buffer (buffer size pos need)
+  "Grow BUFFER to fit NEED bytes at POS (cold path only).  Returns
+(VALUES NEW NEW-SIZE)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum size pos need))
+  (let ((new-size size))
+    (declare (type fixnum new-size))
+    ;; grow 4x at a time: repeated doubling spends ~1x of the final size
+    ;; in copied bytes, 4x growth spends ~1/3x
+    (loop while (< new-size (+ pos need)) do (setf new-size (* 4 new-size)))
+    (let ((new (make-octet-buffer new-size)))
+      (replace new buffer :end2 size)
+      (values new new-size))))
 
 ;;; ------------------------------------------------------------------
 ;;; Stored blocks
@@ -168,12 +177,18 @@
      (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
            nbits (- nbits ,n))))
 
-(defmacro %inflate-decode-slow (root counts first syms idx target)
-  "Canonical bit walk for codes longer than ROOT; caller already peeked."
-  `(let ((code (reverse-bits (logand accum (aref +low-bit-masks+ ,root)) ,root))
-         (index ,idx)
+(defmacro %inflate-decode-slow (table root)
+  "Canonical bit walk for codes longer than ROOT; yields the symbol value.
+Cold path: tables load from TABLE itself, keeping them out of the hot
+loop's register working set."
+  `(let ((counts (hdt-counts ,table))
+         (first (hdt-first ,table))
+         (syms (hdt-symbols ,table))
+         (index (hdt-index-root ,table))
+         (code (reverse-bits (logand accum (aref +low-bit-masks+ ,root)) ,root))
          (len ,root))
-     (declare (type fixnum code index len))
+     (declare (type fixnum code index len)
+              (type (simple-array fixnum (*)) counts first syms))
      (%inflate-refill ,root)
      (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,root)))
            nbits (- nbits ,root))
@@ -185,21 +200,21 @@
        (setf code (logior (ash code 1) (logand accum 1))
              accum (definitely-the (unsigned-byte 64) (ash accum -1))
              nbits (1- nbits))
-       (let ((count (aref ,counts len)))
+       (let ((count (aref counts len)))
          (declare (type fixnum count))
-         (when (< (- code count) (aref ,first len))
-           (setf ,target (aref ,syms (+ index (- code (aref ,first len)))))
-           (return))
+         (when (< (- code count) (aref first len))
+           (return (aref syms (+ index (- code (aref first len))))))
          (setf index (+ index count))))))
 
-(defmacro %inflate-decode-one (root fast counts first syms idx target)
-  "Decode one symbol into TARGET (fast table, slow walk fallback)."
+(defmacro %inflate-decode-one (table root fast)
+  "Decode one symbol from TABLE; yields its value, register-kept on the
+fast path (no symbol store/load roundtrip through memory)."
   `(progn
      (%inflate-fill ,root)
      (let ((entry (aref ,fast (logand accum (aref +low-bit-masks+ ,root)))))
        (declare (type fixnum entry))
        (if (zerop entry)
-           (%inflate-decode-slow ,root ,counts ,first ,syms ,idx ,target)
+           (%inflate-decode-slow ,table ,root)
            (let ((clen (ash entry -9)))
              (declare (type fixnum clen))
              ;; Consume only after enough bits are known present: with a
@@ -207,8 +222,8 @@
              ;; decoding garbage.
              (%inflate-refill clen)
              (setf accum (definitely-the (unsigned-byte 64) (ash accum (- clen)))
-                   nbits (- nbits clen)
-                   ,target (logand entry #x1FF)))))))
+                   nbits (- nbits clen))
+             (logand entry #x1FF))))))
 
 (declaim (inline %copy-tiny-match %copy-run-match %copy-fresh-match
                  %copy-overlap-match %copy-inflate-match))
@@ -270,37 +285,39 @@ case: ~60% of matches are <= 8 bytes) beat REPLACE call overhead."
         ((<= length distance) (%copy-fresh-match buffer pos src length))
         (t (%copy-overlap-match buffer pos src distance length))))
 
-(defmacro %emit-inflate-match ()
-  "Decode length/distance extras and copy one match.  Uses the loop locals
-SYM DSYM BUFFER SIZE POS (rebinding all three) plus the bit/table locals."
+(defmacro %emit-inflate-match (s)
+  "Decode length/distance extras for length code S and copy one match.
+Uses the loop locals BUFFER SIZE POS (rebinding all three) plus the
+bit/table locals; S is evaluated three times (pass a variable)."
   `(progn
-     (when (> sym 285)
+     (when (> ,s 285)
        (error 'newzlib-format-error :detail "invalid length code"))
      ;; one combined load yields base and extra-bits count
-     (let* ((be (length-base+extra (- sym 257)))
+     (let* ((be (length-base+extra (- ,s 257)))
             (eb (ash be -16)))
        (declare (type (unsigned-byte 32) be) (type fixnum eb))
        (%inflate-refill eb)
        (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
          (declare (type fixnum length))
-         (%inflate-decode-one droot dfast dcounts dfirst dsyms didx dsym)
-         (when (> dsym 29)
-           (error 'newzlib-format-error :detail "invalid distance code"))
-         (let* ((bde (dist-base+extra dsym))
-                (deb (ash bde -16)))
-           (declare (type (unsigned-byte 32) bde) (type fixnum deb))
-           (%inflate-refill deb)
-           (let ((distance (+ (logand bde #xFFFF) (%inflate-take deb))))
-             (declare (type fixnum distance))
-             (when (> distance pos)
-               (error 'newzlib-format-error
-                      :detail "match distance exceeds output"))
-             (let ((src (- pos distance)))
-               (declare (type fixnum src))
-               (multiple-value-bind (nbuffer nsize)
-                   (ensure-out-capacity buffer size pos length)
-                 (setf buffer nbuffer size nsize
-                       pos (%copy-inflate-match buffer pos src distance length))))))))))
+         (let ((ds (%inflate-decode-one dist droot dfast)))
+           (declare (type fixnum ds))
+           (when (> ds 29)
+             (error 'newzlib-format-error :detail "invalid distance code"))
+           (let* ((bde (dist-base+extra ds))
+                  (deb (ash bde -16)))
+             (declare (type (unsigned-byte 32) bde) (type fixnum deb))
+             (%inflate-refill deb)
+             (let ((distance (+ (logand bde #xFFFF) (%inflate-take deb))))
+               (declare (type fixnum distance))
+               (when (> distance pos)
+                 (error 'newzlib-format-error
+                        :detail "match distance exceeds output"))
+              (let ((src (- pos distance)))
+                (declare (type fixnum src))
+                (multiple-value-bind (nbuffer nsize)
+                    (ensure-out-capacity buffer size pos length)
+                  (setf buffer nbuffer size nsize
+                        pos (%copy-inflate-match buffer pos src distance length)))))))))))
 
 (defmacro %with-inflate-tables ((lit dist) &body body)
   "Bind LIT/DIST decode-table locals (LROOT..DIDX) with types around BODY."
@@ -325,28 +342,29 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
            (type fixnum size pos))
   (let ((accum (br-accum reader)) (nbits (br-nbits reader))
         (rpos (br-pos reader)) (rend (br-end reader))
-        (rbuf (br-buffer reader)) (sym 0) (dsym 0))
+        (rbuf (br-buffer reader)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend sym dsym)
+             (type fixnum nbits rpos rend)
              (type (simple-array (unsigned-byte 8) (*)) rbuf))
     ;; Pin the input once: refills below allocate nothing (no per-refill
     ;; SAP consing), so no GC intervenes; output growth never moves RBUF.
     (with-pinned-input (rsap rbuf)
       (%with-inflate-tables (lit dist)
         (loop
-          (%inflate-decode-one lroot lfast lcounts lfirst lsyms lidx sym)
-          (cond ((< sym 256)
-                 (multiple-value-bind (nbuffer nsize)
-                     (ensure-out-capacity buffer size pos 1)
-                   (setf buffer nbuffer size nsize)
-                   (setf (aref buffer pos) sym)
-                   (incf pos)))
-                ((= sym 256)
-                 (setf (br-accum reader) accum
-                       (br-nbits reader) nbits
-                       (br-pos reader) rpos)
-                 (return (values buffer pos size)))
-                (t (%emit-inflate-match))))))))
+          (let ((s (%inflate-decode-one lit lroot lfast)))
+            (declare (type fixnum s))
+            (cond ((< s 256)
+                   (multiple-value-bind (nbuffer nsize)
+                       (ensure-out-capacity buffer size pos 1)
+                     (setf buffer nbuffer size nsize)
+                     (setf (aref buffer pos) s)
+                     (incf pos)))
+                  ((= s 256)
+                   (setf (br-accum reader) accum
+                         (br-nbits reader) nbits
+                         (br-pos reader) rpos)
+                   (return (values buffer pos size)))
+                  (t (%emit-inflate-match s)))))))))
 ;;; ------------------------------------------------------------------
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------

@@ -59,12 +59,25 @@
   "Read all octets from SOURCE (a binary input stream or a pathname
   designator) into a fresh octet vector."
   (if (streamp source)
-      (let ((out (make-growable-buffer 1024))
-            (buffer (make-octet-buffer 4096)))
-        (loop for n = (read-sequence buffer source)
-              while (plusp n) do
-                (loop for i below n do (vector-push-extend (aref buffer i) out)))
-        (subseq out 0 (length out)))
+      (let ((size 4096)
+            (pos 0))
+        (declare (type fixnum size pos))
+        (let ((out (make-octet-buffer size))
+              (buffer (make-octet-buffer 4096)))
+          (loop for n = (read-sequence buffer source)
+                while (plusp n) do
+                  (when (> (+ pos n) size)
+                    (let ((new-size (max (* 2 size) (+ pos n))))
+                      (declare (type fixnum new-size))
+                      (let ((bigger (make-octet-buffer new-size)))
+                        (replace bigger out :end2 pos)
+                        (setf out bigger
+                              size new-size))))
+                  (replace out buffer :start1 pos :end1 (+ pos n) :end2 n)
+                  (incf pos n))
+          (let ((result (make-octet-buffer pos)))
+            (replace result out :end2 pos)
+            result)))
       (with-open-file (s (pathname source) :direction :input
                          :element-type '(unsigned-byte 8))
         (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))

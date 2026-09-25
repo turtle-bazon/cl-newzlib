@@ -26,20 +26,24 @@
 (defconstant +max-match+ 258)
 (defconstant +max-dist+ 32768)
 (defconstant +max-stored-block+ 65535)
+(defconstant +large-deflate-input+ 1048576)
 
 ;;; Compression-level tuning, mirroring zlib's configuration_table
 ;;; (good_length, max_lazy, nice_length, max_chain).  Lazy matching is only
 ;;; used for levels >= 4 (deflate_slow); levels 1-3 are greedy (deflate_fast).
-(defun good-length (level)
-  (case level
-    (0 0)
-    ((1 2 3) 4)
-    ((4 5) 8)
-    ((6 7) 4)
-    (8 32)
-    (9 32)
-    (otherwise (error 'newzlib-parameter-error
-                      :detail (format nil "invalid compression level ~A" level)))))
+(defun good-length (level &optional (size 0))
+  (declare (type fixnum level size))
+  (if (and (> size +large-deflate-input+) (or (= level 6) (= level 7)))
+      3
+      (case level
+        (0 0)
+        ((1 2 3) 4)
+        ((4 5) 8)
+        ((6 7) 4)
+        (8 32)
+        (9 32)
+        (otherwise (error 'newzlib-parameter-error
+                          :detail (format nil "invalid compression level ~A" level))))))
 
 (defun lazy-length (level)
   (case level
@@ -71,20 +75,29 @@
     (otherwise (error 'newzlib-parameter-error
                       :detail (format nil "invalid compression level ~A" level)))))
 
-(defun chain-limit (level)
-  (case level
-    (0 0)
-    (1 4)
-    (2 8)
-    (3 32)
-    (4 16)
-    (5 32)
-    (6 48)
-    (7 96)
-    (8 384)
-    (9 1536)
-    (otherwise (error 'newzlib-parameter-error
-                      :detail (format nil "invalid compression level ~A" level)))))
+(defun chain-limit (level &optional (size 0))
+  (declare (type fixnum level size))
+  (let ((base (case level
+                (0 0)
+                (1 4)
+                (2 8)
+                (3 32)
+                (4 16)
+                (5 32)
+                (6 48)
+                (7 96)
+                (8 384)
+                (9 1536)
+                (otherwise (error 'newzlib-parameter-error
+                                  :detail (format nil "invalid compression level ~A" level))))))
+    (if (> size +large-deflate-input+)
+        (case level
+          (6 24)
+          (7 48)
+          (8 192)
+          (9 768)
+          (otherwise base))
+        base)))
 
 ;;; Return-type proclamations keep the callers' token bookkeeping fully
 ;;; unboxed (the multiple values feed straight into fixnum arithmetic).
@@ -618,8 +631,8 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
            (type fixnum start end level token-capacity))
   (multiple-value-bind (nsym extra-bits tokens token-capacity)
       (%lz77-search input start end
-                    (nice-length level) (good-length level)
-                    (chain-limit level) (lazy-length level) (> level 3)
+                    (nice-length level) (good-length level (- end start))
+                    (chain-limit level (- end start)) (lazy-length level) (> level 3)
                     tokens token-capacity head prev lit-freq dist-freq)
     (multiple-value-bind (final-nsym tokens token-capacity)
         (finish-token-stream tokens token-capacity lit-freq nsym)

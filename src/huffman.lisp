@@ -14,6 +14,7 @@
 (defconstant +d-codes+ 30)
 (defconstant +bl-codes+ 19)
 (defconstant +max-code-length+ 15)
+(defconstant +max-decode-root+ 12)
 (defconstant +max-bl-bits+ 7)
 (defconstant +end-block+ 256)
 
@@ -312,9 +313,11 @@ FAST INDEX-ROOT), the table and the count of symbols it covers."
                                              (root 10))
   "Build a canonical Huffman decode table from the code lengths in
 LENGTHS[START,START+N).  ROOT bits look up at once through a fast jump
-table; longer codes fall back to a canonical walk."
+table; longer codes fall back to a canonical walk.  NIL selects an
+adaptive root capped at +MAX-DECODE-ROOT+."
   (declare (type (simple-array fixnum (*)) lengths)
-           (type fixnum start n root)
+           (type fixnum start n)
+           (type (or null fixnum) root)
            (optimize (speed 3) (safety 0)))
   (let ((counts (make-array (1+ +max-code-length+)
                             :element-type '(unsigned-byte 16)
@@ -334,11 +337,14 @@ table; longer codes fall back to a canonical walk."
     (let ((max-length (%place-decode-symbols lengths start n offsets
                                               symbols counts)))
       (declare (type fixnum max-length))
-      (multiple-value-bind (fast index-root)
-          (%fill-decode-fast counts first offsets symbols
-                              (min (max 1 root) max-length))
-        (make-hdt counts first offsets symbols max-length
-                  (min (max 1 root) max-length) fast index-root)))))
+      (let ((decode-root (if root
+                             (min (max 1 root) max-length)
+                             (min +max-decode-root+ (max 1 max-length)))))
+        (declare (type fixnum decode-root))
+        (multiple-value-bind (fast index-root)
+            (%fill-decode-fast counts first offsets symbols decode-root)
+          (make-hdt counts first offsets symbols max-length
+                    decode-root fast index-root))))))
 
 (declaim (inline huffman-decode))
 (defun huffman-decode (table reader)

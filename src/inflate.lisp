@@ -39,6 +39,34 @@
   "Return the fixed Huffman decode tables (built at load time)."
   (values +fixed-lit-table+ +fixed-dist-table+))
 
+(defconstant +max-dynamic-lengths+ 320)
+
+(defstruct (inflate-scratch
+            (:constructor %make-inflate-scratch)
+            (:conc-name is-))
+  (cl-lengths nil :type (simple-array fixnum (19)))
+  (lengths nil :type (simple-array fixnum (*))))
+
+(defparameter *inflate-scratch-pool* '())
+(defparameter *inflate-scratch-pool-max* 4)
+
+(defun make-inflate-scratch ()
+  (%make-inflate-scratch
+   :cl-lengths (make-array 19 :element-type 'fixnum :initial-element 0)
+   :lengths (make-array +max-dynamic-lengths+ :element-type 'fixnum
+                        :initial-element 0)))
+
+(defun acquire-inflate-scratch ()
+  (or (with-scratch-lock (pop *inflate-scratch-pool*))
+      (make-inflate-scratch)))
+
+(defun release-inflate-scratch (scratch)
+  (declare (type inflate-scratch scratch))
+  (with-scratch-lock
+    (when (< (length *inflate-scratch-pool*) *inflate-scratch-pool-max*)
+      (push scratch *inflate-scratch-pool*)))
+  nil)
+
 ;;; ------------------------------------------------------------------
 ;;; Bit alignment
 ;;; ------------------------------------------------------------------
@@ -133,6 +161,8 @@ growth steps; steady state reuses high-water buffers anyway.")
 ;;; ------------------------------------------------------------------
 ;;; Stored blocks
 ;;; ------------------------------------------------------------------
+
+(defconstant +inflate-headroom+ 4096)
 
 (defun inflate-stored-block (reader buffer size pos &optional limit)
   "Decode one stored block into BUFFER[POS..].  Returns (VALUES BUFFER POS SIZE)."
@@ -377,6 +407,34 @@ bit/table locals; S is evaluated three times (pass a variable)."
                        (setf buffer nbuffer size nsize
                              pos (%copy-inflate-match buffer pos src distance length))))))))))))
 
+(defmacro %emit-inflate-match-unchecked (s)
+  "Decode and copy a match when the caller has reserved output headroom."
+  `(progn
+     (when (> ,s 285)
+       (error 'newzlib-format-error :detail "invalid length code"))
+     (let* ((be (length-base+extra (- ,s 257)))
+            (eb (ash be -16)))
+       (declare (type (unsigned-byte 32) be) (type fixnum eb))
+       (%inflate-refill eb)
+       (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
+         (declare (type fixnum length))
+         (let ((ds (%inflate-decode-one dist droot dfast)))
+           (declare (type fixnum ds))
+           (when (> ds 29)
+             (error 'newzlib-format-error :detail "invalid distance code"))
+           (let* ((bde (dist-base+extra ds))
+                  (deb (ash bde -16)))
+             (declare (type (unsigned-byte 32) bde) (type fixnum deb))
+             (%inflate-refill deb)
+             (let ((distance (+ (logand bde #xFFFF) (%inflate-take deb))))
+               (declare (type fixnum distance))
+               (when (> distance pos)
+                 (error 'newzlib-format-error
+                        :detail "match distance exceeds output"))
+               (let ((src (- pos distance)))
+                 (declare (type fixnum src))
+                 (setf pos (%copy-inflate-match buffer pos src distance length))))))))))
+
 (defmacro %with-inflate-tables ((lit dist) &body body)
   "Bind the fast decode-table locals used by the token loop around BODY."
   `(let ((lroot (hdt-root ,lit)) (lfast (hdt-fast ,lit))
@@ -384,6 +442,57 @@ bit/table locals; S is evaluated three times (pass a variable)."
      (declare (type fixnum lroot droot)
               (type (simple-array (unsigned-byte 16) (*)) lfast dfast))
      ,@body))
+
+(defmacro %inflate-bounded-loop (while label)
+  `(loop ,@(if while (list while) nil) do
+     (let ((s (%inflate-decode-one lit lroot lfast)))
+       (declare (type fixnum s))
+       (cond
+         ((< s 256)
+          (when (> (1+ pos) limit)
+            (error 'newzlib-parameter-error
+                   :detail (format nil
+                                   "output buffer has ~D octets; ~D required"
+                                   limit (1+ pos))))
+          (setf (aref buffer pos) s)
+          (incf pos))
+         ((= s 256)
+          (setf (br-accum reader) accum
+                (br-nbits reader) nbits
+                (br-pos reader) rpos)
+          (return-from ,label (values buffer pos size)))
+          (t (%emit-inflate-match s t))))))
+
+(defmacro %inflate-bounded-paired-loop (while label)
+  `(loop ,@(if while (list while) nil) do
+     (let ((s1 (%inflate-decode-one lit lroot lfast)))
+       (declare (type fixnum s1))
+       (cond
+         ((< s1 256)
+          (let ((s2 (%inflate-decode-one lit lroot lfast)))
+            (declare (type fixnum s2))
+            (cond
+              ((< s2 256)
+               (setf (aref buffer pos) s1
+                     (aref buffer (1+ pos)) s2)
+               (incf pos 2))
+              ((= s2 256)
+               (setf (aref buffer pos) s1)
+               (incf pos)
+               (setf (br-accum reader) accum
+                     (br-nbits reader) nbits
+                     (br-pos reader) rpos)
+               (return-from ,label (values buffer pos size)))
+              (t
+               (setf (aref buffer pos) s1)
+               (incf pos)
+               (%emit-inflate-match-unchecked s2)))))
+         ((= s1 256)
+          (setf (br-accum reader) accum
+                (br-nbits reader) nbits
+                (br-pos reader) rpos)
+          (return-from ,label (values buffer pos size)))
+         (t (%emit-inflate-match-unchecked s1))))))
 
 (defun inflate-token-stream (reader buffer size pos lit dist &optional limit)
   "Decode literal/length-distance tokens into BUFFER[POS..] via LIT/DIST.
@@ -405,20 +514,21 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
     (with-pinned-input (rsap rbuf)
       (%with-inflate-tables (lit dist)
         (loop
+          (unless (<= (+ pos +inflate-headroom+) size)
+            (multiple-value-bind (nbuffer nsize)
+                (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
+              (setf buffer nbuffer size nsize)))
           (let ((s (%inflate-decode-one lit lroot lfast)))
             (declare (type fixnum s))
             (cond ((< s 256)
-                   (multiple-value-bind (nbuffer nsize)
-                       (ensure-out-capacity buffer size pos 1 limit)
-                     (setf buffer nbuffer size nsize)
-                     (setf (aref buffer pos) s)
-                     (incf pos)))
+                   (setf (aref buffer pos) s)
+                   (incf pos))
                   ((= s 256)
                    (setf (br-accum reader) accum
                          (br-nbits reader) nbits
                          (br-pos reader) rpos)
                    (return (values buffer pos size)))
-                  (t (%emit-inflate-match s)))))))))
+                  (t (%emit-inflate-match-unchecked s)))))))))
 
 (defun inflate-token-stream-bounded (reader buffer pos limit lit dist)
   "Decode a token stream into a caller-sized BUFFER without growth."
@@ -434,23 +544,10 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
              (type fixnum nbits rpos rend size))
     (with-pinned-input (rsap rbuf)
       (%with-inflate-tables (lit dist)
-        (loop
-          (let ((s (%inflate-decode-one lit lroot lfast)))
-            (declare (type fixnum s))
-            (cond ((< s 256)
-                   (when (> (1+ pos) limit)
-                     (error 'newzlib-parameter-error
-                            :detail (format nil
-                                            "output buffer has ~D octets; ~D required"
-                                            limit (1+ pos))))
-                   (setf (aref buffer pos) s)
-                   (incf pos))
-                  ((= s 256)
-                   (setf (br-accum reader) accum
-                         (br-nbits reader) nbits
-                         (br-pos reader) rpos)
-                   (return (values buffer pos size)))
-                  (t (%emit-inflate-match s t)))))))))
+        (block decode-done
+          (%inflate-bounded-paired-loop
+           (<= (+ pos +inflate-headroom+) limit) decode-done)
+          (%inflate-bounded-loop nil decode-done))))))
 
 (defun %inflate-token-stream (reader buffer size pos lit dist limit)
   (declare (optimize (speed 3) (safety 0))
@@ -467,61 +564,93 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
 ;;; Dynamic block header
 ;;; ------------------------------------------------------------------
 
-(defun %read-cl-repeat (reader sym i total lengths)
-  "Apply code-length repeat SYM at index I of LENGTHS; returns the new I."
-  (declare (optimize (speed 3) (safety 0))
-           (type fixnum sym i total)
-           (type (simple-array fixnum (*)) lengths))
-  (labels ((fill-run (value rep)
-             (declare (type fixnum value rep))
-             (dotimes (k rep)
-               (declare (ignore k))
-               (when (>= i total)
-                 (error 'newzlib-format-error
-                        :detail "code length repeat overruns table"))
-               (setf (aref lengths i) value)
-               (incf i))))
-    (cond ((= sym 16)
-           (when (zerop i)
-             (error 'newzlib-format-error
-                    :detail "repeat code 16 with no previous length"))
-           (fill-run (aref lengths (1- i)) (+ (read-bits reader 2) 3)))
-          (t (fill-run 0 (+ (read-bits reader (if (= sym 17) 3 7))
-                            (if (= sym 17) 3 11))))))
-  i)
-
-(defun inflate-dynamic-header (reader)
+(defun inflate-dynamic-header (reader &optional scratch)
   "Decode the dynamic block header, returning (VALUES LIT DIST) decode tables."
   (declare (optimize (speed 3) (safety 0)))
-  (let ((hlit (+ (read-bits reader 5) 257))
-        (hdist (+ (read-bits reader 5) 1))
-        (hclen (+ (read-bits reader 4) 4)))
-    (declare (type fixnum hlit hdist hclen))
-    (let ((cl-lengths (make-array 19 :element-type 'fixnum :initial-element 0)))
-      (dotimes (i hclen)
-        (setf (aref cl-lengths (aref +code-length-order+ i)) (read-bits reader 3)))
-      (let ((cl-tree (build-huffman-decode-table cl-lengths 0 19 nil))
-            (lengths (make-array (+ hlit hdist) :element-type 'fixnum
-                                 :initial-element 0))
-            (total (+ hlit hdist))
-            (i 0))
-        (declare (type fixnum total i))
-        (loop while (< i total) do
-          (let ((sym (huffman-decode cl-tree reader)))
-            (declare (type fixnum sym))
-            (cond ((< sym 16) (setf (aref lengths i) sym) (incf i))
-                  ((<= 16 sym 18)
-                   (setf i (%read-cl-repeat reader sym i total lengths)))
-                  (t (error 'newzlib-format-error
-                            :detail "invalid code length code")))))
-        (values (build-huffman-decode-table lengths 0 hlit nil)
-                (build-huffman-decode-table lengths hlit hdist nil))))))
+  (let ((accum (br-accum reader)) (nbits (br-nbits reader))
+        (rpos (br-pos reader)) (rend (br-end reader))
+        (rbuf (br-buffer reader)))
+    (declare (type (unsigned-byte 64) accum)
+             (type fixnum nbits rpos rend)
+             (type (simple-array (unsigned-byte 8) (*)) rbuf))
+    (with-pinned-input (rsap rbuf)
+      (%inflate-refill 5)
+      (let ((hlit (+ (%inflate-take 5) 257)))
+        (declare (type fixnum hlit))
+        (%inflate-refill 5)
+        (let ((hdist (+ (%inflate-take 5) 1)))
+          (declare (type fixnum hdist))
+          (%inflate-refill 4)
+          (let ((hclen (+ (%inflate-take 4) 4)))
+            (declare (type fixnum hclen))
+            (let ((cl-lengths (if scratch
+                                 (progn
+                                   (fill (is-cl-lengths scratch) 0)
+                                   (is-cl-lengths scratch))
+                                 (make-array 19 :element-type 'fixnum
+                                               :initial-element 0))))
+              (dotimes (i hclen)
+                (%inflate-refill 3)
+                (setf (aref cl-lengths (aref +code-length-order+ i))
+                      (%inflate-take 3)))
+              (let* ((cl-tree (build-huffman-decode-table
+                              cl-lengths 0 19 nil))
+                     (clroot (hdt-root cl-tree))
+                     (clfast (hdt-fast cl-tree))
+                     (lengths (if scratch
+                                  (progn
+                                    (fill (is-lengths scratch) 0)
+                                    (is-lengths scratch))
+                                  (make-array (+ hlit hdist)
+                                               :element-type 'fixnum
+                                               :initial-element 0)))
+                     (total (+ hlit hdist))
+                     (i 0))
+                (declare (type fixnum clroot total i)
+                         (type (simple-array (unsigned-byte 16) (*)) clfast))
+                (labels ((fill-run (value rep)
+                           (declare (type fixnum value rep))
+                           (dotimes (k rep)
+                             (declare (ignore k))
+                             (when (>= i total)
+                               (error 'newzlib-format-error
+                                      :detail "code length repeat overruns table"))
+                             (setf (aref lengths i) value)
+                             (incf i))))
+                  (loop while (< i total) do
+                    (let ((sym (%inflate-decode-one cl-tree clroot clfast)))
+                      (declare (type fixnum sym))
+                      (cond
+                        ((< sym 16)
+                         (setf (aref lengths i) sym)
+                         (incf i))
+                        ((= sym 16)
+                         (when (zerop i)
+                           (error 'newzlib-format-error
+                                  :detail "repeat code 16 with no previous length"))
+                         (%inflate-refill 2)
+                         (fill-run (aref lengths (1- i))
+                                   (+ (%inflate-take 2) 3)))
+                        ((= sym 17)
+                         (%inflate-refill 3)
+                         (fill-run 0 (+ (%inflate-take 3) 3)))
+                        ((= sym 18)
+                         (%inflate-refill 7)
+                         (fill-run 0 (+ (%inflate-take 7) 11)))
+                        (t
+                         (error 'newzlib-format-error
+                                :detail "invalid code length code")))))
+                (setf (br-accum reader) accum
+                      (br-nbits reader) nbits
+                      (br-pos reader) rpos)
+                (values (build-huffman-decode-table lengths 0 hlit nil)
+                        (build-huffman-decode-table lengths hlit hdist nil)))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Block driver
 ;;; ------------------------------------------------------------------
 
-(defun inflate-blocks (reader buffer size pos &optional limit)
+(defun inflate-blocks (reader buffer size pos &optional limit scratch)
   "Decode consecutive DEFLATE blocks from READER into BUFFER[POS..].  Returns
 (VALUES BUFFER POS SIZE)."
   (declare (optimize (speed 3) (safety 0))
@@ -544,7 +673,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
              (setf buffer nbuffer
                    pos npos
                    size nsize))))
-      (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader)
+      (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader scratch)
            (multiple-value-bind (nbuffer npos nsize)
                (%inflate-token-stream reader buffer size pos lit dist limit)
              (setf buffer nbuffer
@@ -565,6 +694,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
     (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
   (let ((reader (make-bit-reader input start end))
         (buffer (acquire-output-buffer))
+        (scratch (acquire-inflate-scratch))
         (pos 0))
     (declare (type fixnum pos)
              (type (simple-array (unsigned-byte 8) (*)) buffer))
@@ -572,12 +702,13 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
       (declare (type fixnum size))
       (unwind-protect
            (multiple-value-bind (nbuffer npos)
-               (inflate-blocks reader buffer size pos)
+               (inflate-blocks reader buffer size pos nil scratch)
              (setf buffer nbuffer)
              (let ((result (make-octet-buffer npos)))
                (replace result nbuffer :end2 npos)
                result))
-        (release-output-buffer buffer)))))
+        (release-output-buffer buffer)
+        (release-inflate-scratch scratch)))))
 
 (defun inflate-raw-into (output input &optional (start 0) (end (length input)))
   (declare (type (simple-array (unsigned-byte 8) (*)) output input)
@@ -591,8 +722,12 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
   (when (eq output input)
     (error 'newzlib-parameter-error
            :detail "output buffer must not alias input"))
-  (let ((reader (make-bit-reader input start end)))
-    (multiple-value-bind (buffer pos size)
-        (inflate-blocks reader output (length output) 0 (length output))
-      (declare (ignore buffer size))
-      pos)))
+  (let ((reader (make-bit-reader input start end))
+        (scratch (acquire-inflate-scratch)))
+    (unwind-protect
+         (multiple-value-bind (buffer pos size)
+             (inflate-blocks reader output (length output) 0 (length output)
+                             scratch)
+           (declare (ignore buffer size))
+           pos)
+      (release-inflate-scratch scratch))))

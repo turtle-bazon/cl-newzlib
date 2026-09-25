@@ -631,15 +631,24 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end level token-capacity))
   (check-compression-mode mode)
-  (multiple-value-bind (nsym extra-bits tokens token-capacity)
-      (%lz77-search input start end
-                    (nice-length level) (good-length level (- end start))
-                    (chain-limit level (- end start)) (lazy-length level)
-                    (and (not (eq mode :fast)) (> level 3))
-                    tokens token-capacity head prev lit-freq dist-freq)
-    (multiple-value-bind (final-nsym tokens token-capacity)
-        (finish-token-stream tokens token-capacity lit-freq nsym)
-      (values final-nsym extra-bits tokens token-capacity))))
+  (let ((fast-p (eq mode :fast)))
+    (multiple-value-bind (nsym extra-bits tokens token-capacity)
+        (%lz77-search input start end
+                      (if fast-p
+                          (min 32 (nice-length level))
+                          (nice-length level))
+                      (if fast-p
+                          (min 3 (good-length level (- end start)))
+                          (good-length level (- end start)))
+                      (if fast-p
+                          (min 24 (chain-limit level (- end start)))
+                          (chain-limit level (- end start)))
+                      (lazy-length level)
+                      (and (not fast-p) (> level 3))
+                      tokens token-capacity head prev lit-freq dist-freq)
+      (multiple-value-bind (final-nsym tokens token-capacity)
+          (finish-token-stream tokens token-capacity lit-freq nsym)
+        (values final-nsym extra-bits tokens token-capacity)))))
 
 (defun finish-token-stream (tokens token-capacity lit-freq nsym)
   "Append the end-of-block token and return the final token state."

@@ -69,6 +69,16 @@
            (is (equalp data (decompress-octets compressed :format format)))
            (is (= #xA5 (aref output count))))))
 
+(test paired-decode-text-roundtrip
+  (let* ((data (text-data 20000))
+         (compressed (compress-octets data :format :raw :level 6))
+         (output (make-array (1+ (length data)) :element-type '(unsigned-byte 8)
+                             :initial-element #xA5)))
+    (let ((count (decompress-into output compressed :format :raw)))
+      (is (= count (length data)))
+      (is (equalp data (subseq output 0 count)))
+      (is (= #xA5 (aref output count))))))
+
 (test compress-into-reusable-output
   (loop for format in '(:raw :zlib :gzip)
         for level in '(0 1 6 9)

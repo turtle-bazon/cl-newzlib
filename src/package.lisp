@@ -16,6 +16,7 @@
    #:crc32
    ;; One-shot API
    #:compress-octets
+   #:compress-into
    #:decompress-octets
    #:compress
    #:decompress

@@ -84,6 +84,43 @@ data + Adler-32).  Returns a fresh octet vector."
                  out))
           (release-lz77-scratch scratch)))))
 
+(defun zlib-compress-into (output input level)
+  (check-compression-level level)
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((n (length input)))
+    (check-compression-buffer
+     output
+     (+ 6 (if (zerop level)
+               (stored-block-octets n)
+               (+ n (ash n -3)))))
+    (let ((writer (make-bit-writer-for-buffer output))
+          (scratch (unless (zerop level)
+                     (acquire-lz77-scratch (1+ n)))))
+      (unwind-protect
+           (progn
+             (setf (bw-pos writer) 2)
+             (let ((header (zlib-header-octets level))
+                   (buf (bw-buffer writer)))
+               (setf (aref buf 0) (aref header 0)
+                     (aref buf 1) (aref header 1)))
+             (deflate-into-writer input 0 n writer level scratch)
+             (flush-bits writer)
+             (let* ((pos (bw-pos writer))
+                    (checksum (adler32 input)))
+               (declare (type fixnum pos))
+               (setf (aref output pos)       (ldb (byte 8 24) checksum)
+                     (aref output (+ pos 1)) (ldb (byte 8 16) checksum)
+                     (aref output (+ pos 2)) (ldb (byte 8 8) checksum)
+                     (aref output (+ pos 3)) (ldb (byte 8 0) checksum))
+               (+ pos 4)))
+        (when scratch
+          (release-lz77-scratch scratch))))))
+
 (defun parse-zlib-header (input start end)
   "Validate the zlib header in INPUT[START,END).  Returns the position just
   past the header (including any dictionary id)."

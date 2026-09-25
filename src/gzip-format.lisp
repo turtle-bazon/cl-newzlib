@@ -87,6 +87,47 @@ octet vector."
                  out))
           (release-lz77-scratch scratch)))))
 
+(defun gzip-compress-into (output input level)
+  (check-compression-level level)
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((n (length input)))
+    (check-compression-buffer
+     output
+     (+ 18 (if (zerop level)
+               (stored-block-octets n)
+               (+ n (ash n -3)))))
+    (let ((writer (make-bit-writer-for-buffer output))
+          (scratch (unless (zerop level)
+                     (acquire-lz77-scratch (1+ n)))))
+      (unwind-protect
+           (progn
+             (setf (bw-pos writer) 10)
+             (let ((header (gzip-header-octets level))
+                   (buf (bw-buffer writer)))
+               (replace buf header :end2 10))
+             (deflate-into-writer input 0 n writer level scratch)
+             (flush-bits writer)
+             (let* ((pos (bw-pos writer))
+                    (crc (crc32 input))
+                    (size (ldb (byte 32 0) n)))
+               (declare (type fixnum pos))
+               (setf (aref output pos)       (ldb (byte 8 0) crc)
+                     (aref output (+ pos 1)) (ldb (byte 8 8) crc)
+                     (aref output (+ pos 2)) (ldb (byte 8 16) crc)
+                     (aref output (+ pos 3)) (ldb (byte 8 24) crc)
+                     (aref output (+ pos 4)) (ldb (byte 8 0) size)
+                     (aref output (+ pos 5)) (ldb (byte 8 8) size)
+                     (aref output (+ pos 6)) (ldb (byte 8 16) size)
+                     (aref output (+ pos 7)) (ldb (byte 8 24) size))
+               (+ pos 8)))
+        (when scratch
+          (release-lz77-scratch scratch))))))
+
 (defun gzip-data-start (input start end)
   "Validate the gzip header in INPUT[START,END) and return the position of
   the first DEFLATE byte."

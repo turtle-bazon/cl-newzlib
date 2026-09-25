@@ -53,6 +53,45 @@
                                (is (equalp data d)
                                    (format nil "roundtrip ~A level ~D ~A" name level format)))))))
 
+(test compress-into-reusable-output
+  (loop for format in '(:raw :zlib :gzip)
+        for level in '(0 1 6 9)
+        do (let* ((data (incompressible-data 20000))
+                  (capacity (+ (length data) (ash (length data) -3) 300))
+                  (output (make-array capacity :element-type '(unsigned-byte 8)
+                                       :initial-element #xA5))
+                  (count (compress-into output data :format format :level level))
+                  (expected (compress-octets data :format format :level level)))
+             (is (= count (length expected)))
+             (is (equalp expected (subseq output 0 count)))
+             (is (= #xA5 (aref output count)))
+             (is (equalp data (decompress-octets (subseq output 0 count)
+                                                 :format format)))
+             (let ((second-count (compress-into output data :format format
+                                                :level level)))
+               (is (= second-count count))
+               (is (equalp expected (subseq output 0 count)))))))
+
+(test compress-into-capacity-and-alias
+  (let ((data (incompressible-data 1000)))
+    (signals newzlib-parameter-error
+      (compress-into (make-array 1 :element-type '(unsigned-byte 8)) data))
+    (signals newzlib-parameter-error
+      (compress-into data data))))
+
+(test compress-into-large-stored
+  (let* ((data (incompressible-data 200000))
+         (capacity (+ (length data) (ash (length data) -3) 300))
+         (output (make-array capacity :element-type '(unsigned-byte 8)
+                              :initial-element #xA5)))
+    (dolist (format '(:raw :zlib :gzip))
+      (let* ((count (compress-into output data :format format :level 0))
+             (expected (compress-octets data :format format :level 0)))
+        (is (= count (length expected)))
+        (is (equalp expected (subseq output 0 count)))
+        (is (equalp data (decompress-octets (subseq output 0 count)
+                                            :format format)))))))
+
 (test roundtrip-empty
   (loop for format in '(:zlib :gzip :raw)
         do (let* ((c (compress-octets (empty-data) :format format))

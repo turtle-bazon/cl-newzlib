@@ -41,6 +41,20 @@
     (:gzip (gzip-compress octets 0 (length octets) level))
     (:raw (deflate-raw octets 0 (length octets) level))))
 
+(defun compress-into (output octets &key (format :zlib)
+                                      (level +default-compression+))
+  "Compress OCTETS into the caller-owned simple octet vector OUTPUT and return
+the number of octets written.  The first returned-count elements of OUTPUT
+are valid and its remaining elements are unchanged.  OUTPUT must have the
+format-specific worst-case capacity; level 0 requires only its exact stored
+output size.  OUTPUT must not alias OCTETS."
+  (declare (type simple-array output octets))
+  (check-format format)
+  (case format
+    (:zlib (zlib-compress-into output octets level))
+    (:gzip (gzip-compress-into output octets level))
+    (:raw (deflate-raw-into output octets level))))
+
 (defun decompress-octets (octets &key (format :zlib))
   "Decompress OCTETS, a stream in the given FORMAT (:zlib, :gzip or :raw).
   Returns a fresh octet vector."

@@ -1018,3 +1018,40 @@ Returns a fresh octet vector."
                  (deflate-into-writer input start end writer level scratch)
                  (writer-bytes writer))
             (release-lz77-scratch scratch))))))
+
+(defun check-compression-buffer (buffer required)
+  (unless (typep buffer '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "output must be a simple (unsigned-byte 8) vector"))
+  (unless (>= (length buffer) required)
+    (error 'newzlib-parameter-error
+           :detail (format nil "output buffer has ~D octets; ~D required"
+                           (length buffer) required)))
+  buffer)
+
+(defun deflate-raw-into (output input level)
+  (check-compression-level level)
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((n (length input)))
+    (check-compression-buffer
+     output
+     (if (zerop level)
+         (stored-block-octets n)
+         (+ n (ash n -3) 256)))
+    (let ((writer (make-bit-writer-for-buffer output)))
+      (if (zerop level)
+          (progn
+            (deflate-into-writer input 0 n writer level)
+            (flush-bits writer))
+          (let ((scratch (acquire-lz77-scratch (1+ n))))
+            (unwind-protect
+                 (progn
+                   (deflate-into-writer input 0 n writer level scratch)
+                   (flush-bits writer))
+              (release-lz77-scratch scratch))))
+      (bw-pos writer))))

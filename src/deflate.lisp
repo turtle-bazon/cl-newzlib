@@ -581,7 +581,17 @@ alignment.  Blocks after the first start at a byte boundary."
         (+ 3 pad 32 (* 8 n))
         (+ (* 8 n)
            (+ 3 pad 32)
-           (* (+ 3 32) (1- (ceiling n +max-stored-block+)))))))
+           (* (+ 3 5 32) (1- (ceiling n +max-stored-block+)))))))
+
+(defun stored-block-octets (n)
+  (declare (type fixnum n))
+  (let ((pad (mod (- 8 3) 8)))
+    (ceiling (if (<= n +max-stored-block+)
+                 (+ 3 pad 32 (* 8 n))
+                 (+ (* 8 n)
+                    (+ 3 pad 32)
+                    (* (+ 3 5 32) (1- (ceiling n +max-stored-block+)))))
+             8)))
 
 (defun emit-stored-blocks (writer input start end)
   "Emit INPUT[START,END) as stored blocks, splitting at +MAX-STORED-BLOCK+
@@ -952,16 +962,20 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
                             lit-codes lit-lengths dist-codes dist-lengths
                             nbl hlit hdist hclen)))))))
 
-(defun deflate-into-writer (input start end writer level)
+(defun deflate-into-writer (input start end writer level &optional scratch)
   "Compress INPUT[START,END) into WRITER as one DEFLATE stream.  Level 0
 emits stored blocks; higher levels pick the cheapest block encoding."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
-           (type fixnum start end level))
+           (type bit-writer writer)
+           (type fixnum start end level)
+           (type (or null lz77-scratch) scratch))
   (let ((n (- end start)))
     (declare (type fixnum n))
     (if (zerop level)
         (emit-stored-blocks writer input start end)
-        (let ((scratch (acquire-lz77-scratch (1+ n))))
+        (let ((owned (null scratch)))
+          (unless scratch
+            (setf scratch (acquire-lz77-scratch (1+ n))))
           (unwind-protect
                (progn
                  (fill (lzs-lit-freq scratch) 0)
@@ -979,7 +993,8 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                                           n nsym extra-bits scratch)
                        (%emit-optimized-block writer input start end
                                               n nsym extra-bits scratch))))
-            (release-lz77-scratch scratch))))))
+            (when owned
+              (release-lz77-scratch scratch)))))))
 
 (defun deflate-raw (input &optional (start 0) (end (length input)) (level 6))
   "Compress INPUT[START,END) with raw DEFLATE (no zlib/gzip header) at LEVEL.
@@ -987,13 +1002,19 @@ Returns a fresh octet vector."
   (check-compression-level level)
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
-  ;; worst-case output: stored blocks cost ~1% over the input plus headers
-  (let* ((n (- end start))
-         (bound (+ n (ash n -3) 256))
-         (scratch (acquire-lz77-scratch (1+ n)))
-         (writer (reset-bit-writer (lzs-writer scratch) bound)))
-    (unwind-protect
-         (progn
-           (deflate-into-writer input start end writer level)
-           (writer-bytes writer))
-      (release-lz77-scratch scratch))))
+  (let ((n (- end start)))
+    (declare (type fixnum n))
+    (if (zerop level)
+        (let* ((out (make-octet-buffer (stored-block-octets n)))
+               (writer (make-bit-writer-for-buffer out)))
+          (emit-stored-blocks writer input start end)
+          (flush-bits writer)
+          out)
+        (let* ((bound (+ n (ash n -3) 256))
+               (scratch (acquire-lz77-scratch (1+ n)))
+               (writer (reset-bit-writer (lzs-writer scratch) bound)))
+          (unwind-protect
+               (progn
+                 (deflate-into-writer input start end writer level scratch)
+                 (writer-bytes writer))
+            (release-lz77-scratch scratch))))))

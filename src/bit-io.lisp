@@ -34,6 +34,9 @@
   (%make-bit-writer :buffer (make-octet-buffer initial-size)
                     :size initial-size))
 
+(defun make-bit-writer-for-buffer (buffer)
+  (%make-bit-writer :buffer buffer :size (length buffer)))
+
 ;;; Precomputed (1- (ash 1 count)) for COUNT in 0..63, as unsigned-byte 64.
 ;;; Indexing this table avoids the bignum-allocation guard SBCL would emit
 ;;; for an unconstrained (ASH 1 COUNT) on every bit-I/O call.

@@ -17,6 +17,7 @@
    ;; One-shot API
    #:compress-octets
    #:compress-into
+   #:decompress-into
    #:decompress-octets
    #:compress
    #:decompress

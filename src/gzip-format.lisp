@@ -160,6 +160,36 @@ octet vector."
           (error 'newzlib-format-error :detail "gzip header overruns input"))
         pos))))
 
+(defun gzip-decompress-into (output input)
+  (declare (type (simple-array (unsigned-byte 8) (*)) output input))
+  (unless (typep output '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "output must be a simple (unsigned-byte 8) vector"))
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((data-start (gzip-data-start input 0 (length input))))
+    (unless (>= (length input) (+ data-start 8))
+      (error 'newzlib-format-error :detail "gzip stream missing trailer"))
+    (let* ((trailer (- (length input) 8))
+           (count (inflate-raw-into output input data-start trailer))
+           (expected-crc (logior (aref input trailer)
+                                 (ash (aref input (1+ trailer)) 8)
+                                 (ash (aref input (+ trailer 2)) 16)
+                                 (ash (aref input (+ trailer 3)) 24)))
+           (expected-size (logior (aref input (+ trailer 4))
+                                  (ash (aref input (+ trailer 5)) 8)
+                                  (ash (aref input (+ trailer 6)) 16)
+                                  (ash (aref input (+ trailer 7)) 24))))
+      (unless (= (crc32 output 0 count) expected-crc)
+        (error 'newzlib-format-error :detail "gzip CRC-32 mismatch"))
+      (unless (= (logand count #xFFFFFFFF) expected-size)
+        (error 'newzlib-format-error :detail "gzip ISIZE mismatch"))
+      count)))
+
 (defun gzip-decompress (input &optional (start 0) (end (length input)))
   "Decompress an RFC 1952 gzip stream INPUT[START,END).  Validates the header
   CRC32 and ISIZE.  Returns a fresh octet vector."

@@ -119,6 +119,39 @@ like zlib's INSERT_STRING match_head)."
             (aref head h) pos)
       old)))
 
+(declaim (inline insert-string-hash))
+(defun insert-string-hash (pos hash head prev)
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 32) (*)) head prev)
+           (type fixnum pos hash))
+  (let ((old (aref head hash)))
+    (setf (aref prev (logand pos +window-mask+)) old
+          (aref head hash) pos)
+    old))
+
+(defmacro %ensure-hash-state ()
+  `(unless (= hash-pos pos)
+     (setf hash-a (aref input pos)
+           hash-b (aref input (1+ pos))
+           hash-c (aref input (+ pos 2))
+           hash-value (logand (logxor hash-a (ash hash-b 5) (ash hash-c 10))
+                             +hash-mask+)
+           hash-pos pos)))
+
+(defmacro %advance-hash-state ()
+  `(if (= hash-pos (1- pos))
+       (if (< (+ pos 2) end)
+           (progn
+             (setf hash-a hash-b
+                   hash-b hash-c
+                   hash-c (aref input (+ pos 2))
+                   hash-value (logand
+                               (logxor hash-a (ash hash-b 5) (ash hash-c 10))
+                               +hash-mask+)
+                   hash-pos pos))
+           (setf hash-pos -1))
+       (setf hash-pos -1)))
+
 (declaim (inline %lm-limits %lm-candidate-ok-p %lm-extend %lm-bestpair-ok-p))
 #+(and sbcl cl-newzlib-le)
 (declaim (inline %lm-bestpair-sap))
@@ -230,10 +263,8 @@ DISTANCE), inlining at both search sites; args side-effect-free."
             (:constructor %make-lzs))
   (head nil :type (simple-array (unsigned-byte 32) (*)))   ; hash heads
   (prev nil :type (simple-array (unsigned-byte 32) (*)))   ; chain links
-  (sym nil :type (simple-array (unsigned-byte 16) (*)))    ; literal/length syms
-  (distc nil :type (simple-array (unsigned-byte 16) (*)))  ; distance codes
-  (el nil :type (simple-array (unsigned-byte 16) (*)))     ; match lengths
-  (ed nil :type (simple-array (unsigned-byte 16) (*)))     ; match distances
+  (tokens nil :type (simple-array (unsigned-byte 32) (*)))
+  (token-capacity 0 :type fixnum)
   (lit-freq nil :type (simple-array fixnum (*)))
   (dist-freq nil :type (simple-array fixnum (*)))
   (bl-sym nil :type (simple-array fixnum (*)))
@@ -288,38 +319,40 @@ DISTANCE), inlining at both search sites; args side-effect-free."
 (defun make-fixnum-vector (n)
   (make-array n :element-type 'fixnum))
 
+(defun grow-token-buffer (tokens capacity)
+  (let ((new (make-u32-vector (* 2 capacity))))
+    (replace new tokens)
+    new))
+
 (defun acquire-lz77-scratch (token-size)
-  "Get a LZ77-SCRATCH whose token arrays hold at least TOKEN-SIZE entries.
+  "Get a LZ77-SCRATCH whose token buffer can grow geometrically.
 The hash heads and chain links are cleared to the empty-bucket sentinel
 (#xFFFFFFFF), so every chain terminates inside the current input and
 compression is fully deterministic across calls."
   (let ((s (with-scratch-lock (pop *scratch-pool*))))
     (unless s
-      (setf s (%make-lzs
-               :head (make-u32-vector +hash-size+)
-               :prev (make-u32-vector +window-size+)
-               :sym (make-u16-vector token-size)
-               :distc (make-u16-vector token-size)
-               :el (make-u16-vector token-size)
-               :ed (make-u16-vector token-size)
-               :lit-freq (make-fixnum-vector +heap-size+)
-               :dist-freq (make-fixnum-vector +heap-size+)
-               :bl-sym (make-fixnum-vector 320)
-               :bl-extra (make-fixnum-vector 320)
-               :bl-freq (make-fixnum-vector +heap-size+)
-               :lit-lengths (make-fixnum-vector +l-codes+)
-               :lit-codes (make-fixnum-vector +l-codes+)
-               :dist-lengths (make-fixnum-vector +d-codes+)
-               :dist-codes (make-fixnum-vector +d-codes+)
-               :bl-lengths (make-fixnum-vector +bl-codes+)
-               :bl-codes (make-fixnum-vector +bl-codes+)
-               :work (make-standard-huff-work)
-               :writer (make-bit-writer 4096))))
-    (when (< (length (lzs-sym s)) token-size)
-      (setf (lzs-sym s) (make-u16-vector token-size)
-            (lzs-distc s) (make-u16-vector token-size)
-            (lzs-el s) (make-u16-vector token-size)
-            (lzs-ed s) (make-u16-vector token-size)))
+      (let ((initial (max 1
+                         (min token-size
+                              (max 4096
+                                   (min 1048576 (ash token-size -2)))))))
+        (setf s (%make-lzs
+                 :head (make-u32-vector +hash-size+)
+                 :prev (make-u32-vector +window-size+)
+                 :tokens (make-u32-vector initial)
+                 :token-capacity initial
+                 :lit-freq (make-fixnum-vector +heap-size+)
+                 :dist-freq (make-fixnum-vector +heap-size+)
+                 :bl-sym (make-fixnum-vector 320)
+                 :bl-extra (make-fixnum-vector 320)
+                 :bl-freq (make-fixnum-vector +heap-size+)
+                 :lit-lengths (make-fixnum-vector +l-codes+)
+                 :lit-codes (make-fixnum-vector +l-codes+)
+                 :dist-lengths (make-fixnum-vector +d-codes+)
+                 :dist-codes (make-fixnum-vector +d-codes+)
+                 :bl-lengths (make-fixnum-vector +bl-codes+)
+                 :bl-codes (make-fixnum-vector +bl-codes+)
+                 :work (make-standard-huff-work)
+                 :writer (make-bit-writer 4096)))))
     (fill (lzs-head s) #xFFFFFFFF)
     (fill (lzs-prev s) #xFFFFFFFF)
     s))
@@ -335,48 +368,69 @@ compression is fully deterministic across calls."
 ;;; LZ77 tokenization
 ;;; ------------------------------------------------------------------
 ;;;
-;;; Token representation (parallel arrays):
-;;;   sym[i]  : literal byte (0..255), end-of-block (256) or length code
-;;;             (257..285)
-;;;   dist[i] : distance code (0..29) when sym[i] > 256, else unused
-;;;   el[i]   : match length (3..258) when sym[i] > 256, else unused
-;;;   ed[i]   : match distance (1..32768) when sym[i] > 256, else unused
+(defconstant +token-match-bit+ #x10000000)
 
-;;; Token emission helpers.
-;;;
-;;; These are macros over fixed local names so the LZ77 hot loop can update
-;;; NSYM/EXTRA-BITS and write tokens without boxing any counters into
-;;; closure cells.  They are only called from RUN-LZ77/%LZ77-SEARCH below,
-;;; where every referenced name is bound.
+(defmacro token-symbol (token)
+  `(if (logbitp 28 ,token)
+       (+ 257 (logand ,token #x1F))
+       (logand ,token #x1FF)))
+
+(defmacro token-length-code (token)
+  `(logand ,token #x1F))
+
+(defmacro token-length-extra (token)
+  `(logand (ash ,token -5) #x1F))
+
+(defmacro token-distance-code (token)
+  `(logand (ash ,token -10) #x1F))
+
+(defmacro token-distance-extra (token)
+  `(logand (ash ,token -15) #x1FFF))
+
+(defmacro token-length (token)
+  `(+ (length-base (token-length-code ,token))
+      (token-length-extra ,token)))
+
+(defmacro token-distance (token)
+  `(+ (dist-base (token-distance-code ,token))
+      (token-distance-extra ,token)))
+
+(defmacro %store-token (value)
+  `(if (< nsym token-capacity)
+       (progn
+         (setf (aref tokens nsym) ,value)
+         (incf nsym))
+       (progn
+         (setf tokens (grow-token-buffer tokens token-capacity)
+               token-capacity (* 2 token-capacity))
+         (setf (aref tokens nsym) ,value)
+         (incf nsym))))
 
 (defmacro %emit-literal (p)
-  ;; DIST/EL/ED are only read back for symbols > 256, so literals need not
-  ;; store zeros into them (the arrays hold stale pool data there).
   `(let ((b (aref input ,p)))
-     (setf (aref sym nsym) b)
-     (incf (aref lit-freq b))
-     (incf nsym)))
+     (%store-token b)
+     (incf (aref lit-freq b))))
 
 (defmacro %emit-match (len d)
   `(let* ((le (length-code+extra ,len))
           (de (dist-code+extra ,d))
           (code (logand le #xFF))
-          (dcode (logand de #xFF)))
-     (declare (type (unsigned-byte 32) le de)
-              (type fixnum code dcode))
-     (setf (aref sym nsym) (+ 257 code)
-           (aref dist nsym) dcode
-           (aref el nsym) ,len
-           (aref ed nsym) ,d)
+          (dcode (logand de #xFF))
+          (lextra (- ,len (length-base code)))
+          (dextra (- ,d (dist-base dcode)))
+          (token (logior +token-match-bit+
+                         code
+                         (ash lextra 5)
+                         (ash dcode 10)
+                         (ash dextra 15))))
+     (declare (type (unsigned-byte 32) le de token)
+              (type fixnum code dcode lextra dextra))
+     (%store-token token)
      (incf (aref lit-freq (+ 257 code)))
      (incf (aref dist-freq dcode))
-     (incf extra-bits (+ (ash le -8) (ash de -8)))
-     (incf nsym)))
+     (incf extra-bits (+ (ash le -8) (ash de -8)))))
 
 (defmacro %insert-match-interior (mpos mlen start)
-  ;; rolling 3-byte hash: keep INPUT[Q..Q+2] in locals so each consecutive
-  ;; insertion reads only one fresh byte instead of recomputing HASH-3's
-  ;; three loads from scratch.
   `(let ((limit (min (+ ,mpos ,mlen) (- end 2))))
      (declare (type fixnum limit))
      (loop for q from ,start below limit
@@ -386,14 +440,12 @@ compression is fully deterministic across calls."
          do (let ((h (logand (logxor a (ash b 5) (ash c 10))
                              +hash-mask+)))
               (declare (type fixnum h))
-              ;; link Q after the current chain head, like INSERT-STRING
               (setf (aref prev (logand q +window-mask+)) (aref head h)
                     (aref head h) q)))))
 
 (defmacro %lazy-drain-short ()
-  "No room to search: flush any pending match, emit the rest as literals.
-Leaves POS at END.  Uses the lazy loop's locals (see %LZ77-SEARCH-LAZY)."
   `(progn
+     (setf hash-pos -1)
      (when have-pending
        (if (>= pending-len +min-match+)
            (progn
@@ -408,55 +460,58 @@ Leaves POS at END.  Uses the lazy loop's locals (see %LZ77-SEARCH-LAZY)."
        (incf pos))))
 
 (defmacro %lazy-search-step ()
-  "Insert POS, search, and resolve the new match against the pending one.
-Uses the lazy loop's locals (see %LZ77-SEARCH-LAZY)."
-  `(let ((cand (insert-string input pos head prev)))
-     (declare (type fixnum cand))
-     (let ((mlen 0) (mdist 0))
-       (declare (type fixnum mlen mdist))
-       (when (and (/= cand #xFFFFFFFF)
-                  (or (not have-pending)
-                      (< pending-len max-lazy)))
-         (multiple-value-bind (len d)
-             (longest-match input pos end cand head prev
-                            max-chain nice good
-                            (if have-pending pending-len (1- +min-match+))
-                            isap)
-           (setf mlen len mdist d)))
-       (cond ((and have-pending
-                   (>= pending-len +min-match+)
-                   (<= mlen pending-len))
-              (%emit-match pending-len pending-dist)
-              (%insert-match-interior pending-pos pending-len (+ pending-pos 2))
-              (setf pos (+ pending-pos pending-len)
-                    have-pending nil))
-             (have-pending
-              (%emit-literal (1- pos))
-              (incf pos)
-              (setf pending-len mlen
-                    pending-dist mdist
-                    pending-pos (1- pos)))
-             (t (setf have-pending t
-                      pending-len mlen
+  `(progn
+     (%ensure-hash-state)
+     (let ((cand (insert-string-hash pos hash-value head prev)))
+       (declare (type fixnum cand))
+       (let ((mlen 0) (mdist 0))
+         (declare (type fixnum mlen mdist))
+         (when (and (/= cand #xFFFFFFFF)
+                    (or (not have-pending)
+                        (< pending-len max-lazy)))
+           (multiple-value-bind (len d)
+               (longest-match input pos end cand head prev
+                              max-chain nice good
+                              (if have-pending pending-len (1- +min-match+))
+                              isap)
+             (setf mlen len mdist d)))
+         (cond ((and have-pending
+                     (>= pending-len +min-match+)
+                     (<= mlen pending-len))
+                (%emit-match pending-len pending-dist)
+                (%insert-match-interior pending-pos pending-len (+ pending-pos 2))
+                (setf pos (+ pending-pos pending-len)
+                      have-pending nil
+                      hash-pos -1))
+               (have-pending
+                (%emit-literal (1- pos))
+                (incf pos)
+                (%advance-hash-state)
+                (setf pending-len mlen
                       pending-dist mdist
-                      pending-pos pos)
-                (incf pos))))))
+                      pending-pos (1- pos)))
+               (t (setf have-pending t
+                        pending-len mlen
+                        pending-dist mdist
+                        pending-pos pos)
+                  (incf pos)
+                  (%advance-hash-state)))))))
 
 (defun %lz77-search-lazy (input start end nice good max-chain max-lazy
-                           sym dist el ed head prev lit-freq dist-freq)
+                           tokens token-capacity head prev lit-freq dist-freq)
   "Lazy matching (zlib deflate_slow): defer each match one position and
 adopt it only if no longer match starts on the next byte."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end nice good max-chain max-lazy))
+           (type fixnum start end nice good max-chain max-lazy token-capacity))
   (let ((nsym 0) (extra-bits 0) (pos start)
-        (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0))
-    (declare (type fixnum nsym extra-bits pos pending-len pending-dist pending-pos))
-    ;; Pin the input for the walk so the u16 best-pair check loads words
-    ;; with one SAP taken once (output growth never moves INPUT).
+        (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0)
+        (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
+    (declare (type fixnum nsym extra-bits pos pending-len pending-dist
+                        pending-pos hash-pos hash-value hash-a hash-b hash-c))
     (with-pinned-input (isap input)
       (loop while (< pos end) do
         (if (< (- end pos) +min-match+)
@@ -466,100 +521,104 @@ adopt it only if no longer match starts on the next byte."
       (if (>= pending-len +min-match+)
           (%emit-match pending-len pending-dist)
           (%emit-literal pending-pos)))
-    (values nsym extra-bits)))
+    (values nsym extra-bits tokens token-capacity)))
 
 (defun %lz77-search-greedy (input start end nice good max-chain max-lazy
-                             sym dist el ed head prev lit-freq dist-freq)
+                             tokens token-capacity head prev lit-freq dist-freq)
   "Greedy matching (zlib deflate_fast) for levels 1-3."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end nice good max-chain max-lazy))
-  (let ((nsym 0) (extra-bits 0) (pos start))
-    (declare (type fixnum nsym extra-bits pos))
+           (type fixnum start end nice good max-chain max-lazy token-capacity))
+  (let ((nsym 0) (extra-bits 0) (pos start)
+        (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
+    (declare (type fixnum nsym extra-bits pos hash-pos hash-value
+                        hash-a hash-b hash-c))
     (with-pinned-input (isap input)
       (loop while (< pos end) do
         (if (< (- end pos) +min-match+)
             (progn
               (%emit-literal pos)
-              (incf pos))
-            (let ((cand (insert-string input pos head prev)))
-              (declare (type fixnum cand))
-              (if (= cand #xFFFFFFFF)
-                  (progn
-                    (%emit-literal pos)
-                    (incf pos))
-                  (multiple-value-bind (len d)
-                      (longest-match input pos end cand head prev
-                                     max-chain nice good (1- +min-match+)
-                                     isap)
-                    (if (>= len +min-match+)
-                        (progn
-                          (%emit-match len d)
-                          (when (<= len max-lazy)
-                            (%insert-match-interior pos len (1+ pos)))
-                          (incf pos len))
-                        (progn
-                          (%emit-literal pos)
-                          (incf pos)))))))))
-    (values nsym extra-bits)))
+              (incf pos)
+              (setf hash-pos -1))
+            (progn
+              (%ensure-hash-state)
+              (let ((cand (insert-string-hash pos hash-value head prev)))
+                (declare (type fixnum cand))
+                (if (= cand #xFFFFFFFF)
+                    (progn
+                      (%emit-literal pos)
+                      (incf pos)
+                      (%advance-hash-state))
+                    (multiple-value-bind (len d)
+                        (longest-match input pos end cand head prev
+                                       max-chain nice good (1- +min-match+)
+                                       isap)
+                      (if (>= len +min-match+)
+                          (progn
+                            (%emit-match len d)
+                            (when (<= len max-lazy)
+                              (%insert-match-interior pos len (1+ pos)))
+                            (incf pos len)
+                            (setf hash-pos -1))
+                          (progn
+                            (%emit-literal pos)
+                            (incf pos)
+                             (%advance-hash-state)))))))))
+     (values nsym extra-bits tokens token-capacity))))
 
 (defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
-                     sym dist el ed head prev lit-freq dist-freq)
-  "LZ77 tokenization core; see RUN-LZ77.  Returns (VALUES NSYM EXTRA-BITS).
-Dispatches to the lazy (levels 4-9) or greedy (levels 1-3) worker."
+                     tokens token-capacity head prev lit-freq dist-freq)
+  "LZ77 tokenization core; see RUN-LZ77.  Returns four values including the
+possibly-grown token vector and its capacity."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end nice good max-chain max-lazy))
+           (type fixnum start end nice good max-chain max-lazy token-capacity))
   (if lazy-p
       (%lz77-search-lazy input start end nice good max-chain max-lazy
-                         sym dist el ed head prev lit-freq dist-freq)
+                         tokens token-capacity head prev lit-freq dist-freq)
       (%lz77-search-greedy input start end nice good max-chain max-lazy
-                           sym dist el ed head prev lit-freq dist-freq)))
+                           tokens token-capacity head prev lit-freq dist-freq)))
 
-(defun run-lz77 (input start end level sym dist el ed lit-freq dist-freq
+(defun run-lz77 (input start end level tokens token-capacity
+                 lit-freq dist-freq
                  &optional (head (make-array +hash-size+
                                              :element-type '(unsigned-byte 32)
                                              :initial-element #xFFFFFFFF))
                            (prev (make-array +window-size+
                                              :element-type '(unsigned-byte 32)
                                              :initial-element #xFFFFFFFF)))
-  "Run LZ77 over INPUT[START,END), filling SYM/DIST/EL/ED (sized to the
-input length) and the symbol frequency vectors.  Returns (VALUES NSYM
-EXTRA-BITS) where EXTRA-BITS is the total number of length/distance extra
-bits across all matches.  Levels 1-3 use greedy matching (deflate_fast),
-levels 4-9 use lazy matching (deflate_slow) which defers each match one
-position and only adopts it if no longer match starts on the next byte."
+  "Run LZ77 over INPUT[START,END), filling the packed token buffer and the
+symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end level))
-  (multiple-value-bind (nsym extra-bits)
+           (type fixnum start end level token-capacity))
+  (multiple-value-bind (nsym extra-bits tokens token-capacity)
       (%lz77-search input start end
                     (nice-length level) (good-length level)
                     (chain-limit level) (lazy-length level) (> level 3)
-                    sym dist el ed head prev lit-freq dist-freq)
-    (values (finish-token-stream sym el ed lit-freq nsym) extra-bits)))
+                    tokens token-capacity head prev lit-freq dist-freq)
+    (multiple-value-bind (final-nsym tokens token-capacity)
+        (finish-token-stream tokens token-capacity lit-freq nsym)
+      (values final-nsym extra-bits tokens token-capacity))))
 
-(defun finish-token-stream (sym el ed lit-freq nsym)
-  "Append the end-of-block symbol at NSYM and bump its frequency."
-  (declare (type (simple-array (unsigned-byte 16) (*)) sym el ed)
+(defun finish-token-stream (tokens token-capacity lit-freq nsym)
+  "Append the end-of-block token and return the final token state."
+  (declare (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array fixnum (*)) lit-freq)
-           (type fixnum nsym)
+           (type fixnum nsym token-capacity)
            (optimize (speed 3) (safety 0)))
-  (setf (aref sym nsym) 256
-        (aref el nsym) 0
-        (aref ed nsym) 0)
+  (%store-token 256)
   (incf (aref lit-freq 256))
-  (incf nsym)
-  nsym)
+  (values nsym tokens token-capacity))
 
 ;;; ------------------------------------------------------------------
 ;;; Block emission
@@ -656,40 +715,47 @@ code, then for matches the length extra, distance code and distance extra."
       (when (plusp dn)
         (write-bits writer (- ed-i (logand bde #xFFFF)) dn)))))
 
-(defun emit-fixed-block (writer sym dist el ed nsym bfinal)
+(defun emit-fixed-block (writer tokens nsym bfinal)
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type fixnum nsym))
   (ensure-static-trees)
   (write-bits writer (if bfinal 1 0) 1)
   (write-bits writer 1 2)
   (loop for i below nsym do
-    (%emit-coded-token writer (aref sym i) (aref dist i)
-                       (aref el i) (aref ed i)
-                       +static-lit-codes+ +static-lit-lengths+
-                       +static-dist-codes+ +static-dist-lengths+)))
+    (let* ((token (aref tokens i))
+           (s (token-symbol token)))
+      (if (> s 256)
+          (%emit-coded-token writer s (token-distance-code token)
+                             (token-length token) (token-distance token)
+                             +static-lit-codes+ +static-lit-lengths+
+                             +static-dist-codes+ +static-dist-lengths+)
+          (%emit-coded-token writer s 0 0 0
+                             +static-lit-codes+ +static-lit-lengths+
+                             +static-dist-codes+ +static-dist-lengths+)))))
 
-(defun data-bits (sym dist nsym len-array dist-len-array extra-bits)
+(defun data-bits (tokens nsym len-array dist-len-array extra-bits)
   "Total coded bits for the token stream, plus the accumulated EXTRA-BITS."
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 16) (*)) sym dist)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array fixnum (*)) len-array dist-len-array)
            (type fixnum nsym extra-bits))
   (let ((bits extra-bits))
     (declare (type fixnum bits))
     (loop for i below nsym do
-      (let ((s (aref sym i)))
-        (incf bits (aref len-array s))
-        (when (> s 256)
-          (incf bits (aref dist-len-array (aref dist i))))))
+      (let ((token (aref tokens i)))
+        (let ((s (token-symbol token)))
+          (incf bits (aref len-array s))
+          (when (> s 256)
+            (incf bits (aref dist-len-array (token-distance-code token)))))))
     bits))
 
-(defun data-bits/dynamic-and-fixed (sym dist nsym dyn-lens fixed-lens
+(defun data-bits/dynamic-and-fixed (tokens nsym dyn-lens fixed-lens
                                      dist-dyn-lens dist-fixed-lens extra-bits)
   "Like DATA-BITS twice: returns (VALUES DYN-BITS FIXED-BITS) computing both
 size estimates in a single pass over the tokens."
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 16) (*)) sym dist)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array fixnum (*)) dyn-lens fixed-lens
                  dist-dyn-lens dist-fixed-lens)
            (type fixnum nsym extra-bits))
@@ -697,12 +763,13 @@ size estimates in a single pass over the tokens."
         (fixed extra-bits))
     (declare (type fixnum dyn fixed))
     (loop for i below nsym do
-      (let ((s (aref sym i)))
+      (let* ((token (aref tokens i))
+             (s (token-symbol token)))
         (declare (type fixnum s))
         (incf dyn (aref dyn-lens s))
         (incf fixed (aref fixed-lens s))
         (when (> s 256)
-          (let ((d (aref dist i)))
+          (let ((d (token-distance-code token)))
             (declare (type fixnum d))
             (incf dyn (aref dist-dyn-lens d))
             (incf fixed (aref dist-fixed-lens d))))))
@@ -828,21 +895,26 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
         (18 (write-bits writer (aref bl-extra i) 7))
         (otherwise nil)))))
 
-(defun emit-dynamic-block (writer sym dist el ed nsym bfinal
+(defun emit-dynamic-block (writer tokens nsym bfinal
                             lit-codes lit-lengths dist-codes dist-lengths
                             bl-sym bl-extra bl-codes bl-lengths nbl
                             hlit hdist hclen)
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 16) (*)) sym dist el ed)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array fixnum (*)) lit-codes lit-lengths dist-codes
                               dist-lengths bl-sym bl-extra bl-codes bl-lengths)
            (type fixnum nsym nbl hlit hdist hclen))
   (%emit-bl-header writer bfinal hlit hdist hclen)
   (%emit-bl-symbols writer bl-sym bl-extra bl-codes bl-lengths nbl hclen)
   (loop for i below nsym do
-    (%emit-coded-token writer (aref sym i) (aref dist i)
-                       (aref el i) (aref ed i)
-                       lit-codes lit-lengths dist-codes dist-lengths)))
+    (let* ((token (aref tokens i))
+           (s (token-symbol token)))
+      (if (> s 256)
+          (%emit-coded-token writer s (token-distance-code token)
+                             (token-length token) (token-distance token)
+                             lit-codes lit-lengths dist-codes dist-lengths)
+          (%emit-coded-token writer s 0 0 0
+                             lit-codes lit-lengths dist-codes dist-lengths)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Compressor driver
@@ -865,15 +937,14 @@ rarely pay for themselves at that size)."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end n nsym extra-bits))
   (let ((stored-size (stored-block-bits writer n))
-        (fixed-size (+ 3 (data-bits (lzs-sym scratch) (lzs-distc scratch)
-                                    nsym +static-lit-lengths+
+        (fixed-size (+ 3 (data-bits (lzs-tokens scratch) nsym
+                                    +static-lit-lengths+
                                     +static-dist-lengths+ extra-bits))))
     (declare (type fixnum stored-size fixed-size))
     (ensure-static-trees)
     (if (<= stored-size fixed-size)
         (emit-stored-blocks writer input start end)
-        (emit-fixed-block writer (lzs-sym scratch) (lzs-distc scratch)
-                          (lzs-el scratch) (lzs-ed scratch) nsym t))))
+        (emit-fixed-block writer (lzs-tokens scratch) nsym t))))
 
 (defun %span-of-used (lengths hi lo floor)
   "One plus the highest used index in LENGTHS[LO..HI], at least FLOOR."
@@ -920,10 +991,8 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
   (cond ((<= stored-size (min opt-size fixed-size))
          (emit-stored-blocks writer input start end))
         ((<= fixed-size opt-size)
-         (emit-fixed-block writer (lzs-sym scratch) (lzs-distc scratch)
-                           (lzs-el scratch) (lzs-ed scratch) nsym t))
-        (t (emit-dynamic-block writer (lzs-sym scratch) (lzs-distc scratch)
-                               (lzs-el scratch) (lzs-ed scratch) nsym t
+         (emit-fixed-block writer (lzs-tokens scratch) nsym t))
+        (t (emit-dynamic-block writer (lzs-tokens scratch) nsym t
                                lit-codes lit-lengths dist-codes dist-lengths
                                (lzs-bl-sym scratch) (lzs-bl-extra scratch)
                                (lzs-bl-codes scratch) (lzs-bl-lengths scratch)
@@ -952,7 +1021,7 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
           (ensure-static-trees)
           (multiple-value-bind (dyn-bits fixed-bits)
               (data-bits/dynamic-and-fixed
-               (lzs-sym scratch) (lzs-distc scratch) nsym
+               (lzs-tokens scratch) nsym
                lit-lengths +static-lit-lengths+
                dist-lengths +static-dist-lengths+ extra-bits)
             (declare (type fixnum dyn-bits fixed-bits))
@@ -981,13 +1050,14 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                  (fill (lzs-lit-freq scratch) 0)
                  (fill (lzs-dist-freq scratch) 0)
                  (fill (lzs-bl-freq scratch) 0)
-                 (multiple-value-bind (nsym extra-bits)
+                 (multiple-value-bind (nsym extra-bits tokens token-capacity)
                      (run-lz77 input start end level
-                               (lzs-sym scratch) (lzs-distc scratch)
-                               (lzs-el scratch) (lzs-ed scratch)
+                               (lzs-tokens scratch) (lzs-token-capacity scratch)
                                (lzs-lit-freq scratch) (lzs-dist-freq scratch)
                                (lzs-head scratch) (lzs-prev scratch))
-                   (declare (type fixnum nsym extra-bits))
+                   (declare (type fixnum nsym extra-bits token-capacity))
+                   (setf (lzs-tokens scratch) tokens
+                         (lzs-token-capacity scratch) token-capacity)
                    (if (<= n 1024)
                        (%emit-tiny-choice writer input start end
                                           n nsym extra-bits scratch)

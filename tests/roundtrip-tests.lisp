@@ -92,6 +92,31 @@
         (is (equalp data (decompress-octets (subseq output 0 count)
                                             :format format)))))))
 
+(test decompress-into-reusable-output
+  (loop for format in '(:raw :zlib :gzip)
+        for level in '(0 1 6 9)
+        do (let* ((data (incompressible-data 20000))
+                  (compressed (compress-octets data :format format :level level))
+                  (output (make-array (+ (length data) 300)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element #xA5))
+                  (count (decompress-into output compressed :format format)))
+             (is (= count (length data)))
+             (is (equalp data (subseq output 0 count)))
+             (is (= #xA5 (aref output count)))
+             (let ((second-count (decompress-into output compressed :format format)))
+               (is (= second-count count))
+               (is (equalp data (subseq output 0 count)))))))
+
+(test decompress-into-capacity-and-alias
+  (let* ((data (incompressible-data 1000))
+         (compressed (compress-octets data :format :zlib)))
+    (signals newzlib-parameter-error
+      (decompress-into (make-array 1 :element-type '(unsigned-byte 8))
+                       compressed))
+    (signals newzlib-parameter-error
+      (decompress-into compressed compressed))))
+
 (test roundtrip-empty
   (loop for format in '(:zlib :gzip :raw)
         do (let* ((c (compress-octets (empty-data) :format format))

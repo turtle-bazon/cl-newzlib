@@ -57,15 +57,22 @@
 ;;; ------------------------------------------------------------------
 
 (declaim (inline ensure-out-capacity))
-(defun ensure-out-capacity (buffer size pos need)
+(defun ensure-out-capacity (buffer size pos need &optional limit)
   "Grow BUFFER so that at least NEED bytes fit starting at POS.  Returns
 (VALUES BUFFER NEW-SIZE)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum size pos need))
-  (if (<= (+ pos need) size)
-      (values buffer size)
-      (%grow-out-buffer buffer size pos need)))
+           (type fixnum size pos need)
+           (type (or null fixnum) limit))
+  (if limit
+      (if (<= (+ pos need) limit)
+          (values buffer size)
+          (error 'newzlib-parameter-error
+                 :detail (format nil "output buffer has ~D octets; ~D required"
+                                 limit (+ pos need))))
+      (if (<= (+ pos need) size)
+          (values buffer size)
+          (%grow-out-buffer buffer size pos need))))
 
 (defun %grow-out-buffer (buffer size pos need)
   "Grow BUFFER to fit NEED bytes at POS (cold path only).  Returns
@@ -127,11 +134,12 @@ growth steps; steady state reuses high-water buffers anyway.")
 ;;; Stored blocks
 ;;; ------------------------------------------------------------------
 
-(defun inflate-stored-block (reader buffer size pos)
+(defun inflate-stored-block (reader buffer size pos &optional limit)
   "Decode one stored block into BUFFER[POS..].  Returns (VALUES BUFFER POS SIZE)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum size pos))
+           (type fixnum size pos)
+           (type (or null fixnum) limit))
   (align-reader reader)
   (let ((len (read-bits reader 16))
         (nlen (read-bits reader 16)))
@@ -139,7 +147,7 @@ growth steps; steady state reuses high-water buffers anyway.")
     (unless (= (logand (lognot len) #xFFFF) nlen)
       (error 'newzlib-format-error :detail "stored block length mismatch"))
     (multiple-value-bind (buffer size)
-        (ensure-out-capacity buffer size pos len)
+         (ensure-out-capacity buffer size pos len limit)
       ;; drain whole bytes still pending in the reader accumulator
       (iterate:iterate
         (iterate:while (and (plusp len) (>= (br-nbits reader) 8)))
@@ -229,7 +237,8 @@ loop's register working set."
          (code (reverse-bits (logand accum (aref +low-bit-masks+ ,root)) ,root))
          (len ,root))
      (declare (type fixnum code index len)
-              (type (simple-array fixnum (*)) counts first syms))
+               (type (simple-array (unsigned-byte 16) (*))
+                      counts first syms))
      (%inflate-refill ,root)
      (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,root)))
            nbits (- nbits ,root))
@@ -356,7 +365,7 @@ bit/table locals; S is evaluated three times (pass a variable)."
               (let ((src (- pos distance)))
                 (declare (type fixnum src))
                 (multiple-value-bind (nbuffer nsize)
-                    (ensure-out-capacity buffer size pos length)
+                     (ensure-out-capacity buffer size pos length limit)
                   (setf buffer nbuffer size nsize
                         pos (%copy-inflate-match buffer pos src distance length)))))))))))
 
@@ -369,18 +378,19 @@ bit/table locals; S is evaluated three times (pass a variable)."
          (dcounts (hdt-counts ,dist)) (dfirst (hdt-first ,dist))
          (dsyms (hdt-symbols ,dist)) (didx (hdt-index-root ,dist)))
      (declare (type fixnum lroot lidx droot didx)
-              (type (simple-array fixnum (*)) lfast lcounts lfirst lsyms
-                    dcounts dfirst dsyms))
+               (type (simple-array (unsigned-byte 16) (*))
+                      lfast lcounts lfirst lsyms dcounts dfirst dsyms))
      ,@body))
 
-(defun inflate-token-stream (reader buffer size pos lit dist)
+(defun inflate-token-stream (reader buffer size pos lit dist &optional limit)
   "Decode literal/length-distance tokens into BUFFER[POS..] via LIT/DIST.
 Returns (VALUES BUFFER POS SIZE).  Reader state stays in locals (like C
 inflate_fast); it is written back on end-of-block, stale on error abort."
   (declare (optimize (speed 3) (safety 0))
            (type huffman-decode-table lit dist)
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum size pos))
+           (type fixnum size pos)
+           (type (or null fixnum) limit))
   (let ((accum (br-accum reader)) (nbits (br-nbits reader))
         (rpos (br-pos reader)) (rend (br-end reader))
         (rbuf (br-buffer reader)))
@@ -396,7 +406,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
             (declare (type fixnum s))
             (cond ((< s 256)
                    (multiple-value-bind (nbuffer nsize)
-                       (ensure-out-capacity buffer size pos 1)
+                       (ensure-out-capacity buffer size pos 1 limit)
                      (setf buffer nbuffer size nsize)
                      (setf (aref buffer pos) s)
                      (incf pos)))
@@ -464,31 +474,32 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
 ;;; Block driver
 ;;; ------------------------------------------------------------------
 
-(defun inflate-blocks (reader buffer size pos)
+(defun inflate-blocks (reader buffer size pos &optional limit)
   "Decode consecutive DEFLATE blocks from READER into BUFFER[POS..].  Returns
 (VALUES BUFFER POS SIZE)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum size pos))
+           (type fixnum size pos)
+           (type (or null fixnum) limit))
   (iterate:iterate
     (iterate:for bfinal = (read-bits reader 1))
     (iterate:for btype = (read-bits reader 2))
     (declare (type fixnum bfinal btype))
     (case btype
       (0 (multiple-value-bind (nbuffer npos nsize)
-             (inflate-stored-block reader buffer size pos)
+             (inflate-stored-block reader buffer size pos limit)
            (setf buffer nbuffer
                  pos npos
                  size nsize)))
       (1 (multiple-value-bind (lit dist) (ensure-fixed-tables)
            (multiple-value-bind (nbuffer npos nsize)
-               (inflate-token-stream reader buffer size pos lit dist)
+               (inflate-token-stream reader buffer size pos lit dist limit)
              (setf buffer nbuffer
                    pos npos
                    size nsize))))
       (2 (multiple-value-bind (lit dist) (inflate-dynamic-header reader)
            (multiple-value-bind (nbuffer npos nsize)
-               (inflate-token-stream reader buffer size pos lit dist)
+               (inflate-token-stream reader buffer size pos lit dist limit)
              (setf buffer nbuffer
                    pos npos
                    size nsize))))
@@ -520,3 +531,21 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                (replace result nbuffer :end2 npos)
                result))
         (release-output-buffer buffer)))))
+
+(defun inflate-raw-into (output input &optional (start 0) (end (length input)))
+  (declare (type (simple-array (unsigned-byte 8) (*)) output input)
+           (type fixnum start end))
+  (unless (typep output '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "output must be a simple (unsigned-byte 8) vector"))
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((reader (make-bit-reader input start end)))
+    (multiple-value-bind (buffer pos size)
+        (inflate-blocks reader output (length output) 0 (length output))
+      (declare (ignore buffer size))
+      pos)))

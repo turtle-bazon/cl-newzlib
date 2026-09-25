@@ -141,6 +141,30 @@ data + Adler-32).  Returns a fresh octet vector."
           (+ start 6)
           (+ start 2)))))
 
+(defun zlib-decompress-into (output input)
+  (declare (type (simple-array (unsigned-byte 8) (*)) output input))
+  (unless (typep output '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "output must be a simple (unsigned-byte 8) vector"))
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error
+           :detail "input must be an (unsigned-byte 8) vector"))
+  (when (eq output input)
+    (error 'newzlib-parameter-error
+           :detail "output buffer must not alias input"))
+  (let ((data-start (parse-zlib-header input 0 (length input))))
+    (unless (>= (length input) (+ data-start 4))
+      (error 'newzlib-format-error :detail "zlib stream missing Adler-32"))
+    (let* ((deflated-end (- (length input) 4))
+           (count (inflate-raw-into output input data-start deflated-end))
+           (expected (logior (ash (aref input deflated-end) 24)
+                             (ash (aref input (1+ deflated-end)) 16)
+                             (ash (aref input (+ deflated-end 2)) 8)
+                             (aref input (+ deflated-end 3)))))
+      (unless (= (adler32 output 0 count) expected)
+        (error 'newzlib-format-error :detail "zlib Adler-32 mismatch"))
+      count)))
+
 (defun zlib-decompress (input &optional (start 0) (end (length input)))
   "Decompress an RFC 1950 zlib stream INPUT[START,END).  Validates the header
   and Adler-32 checksum.  Returns a fresh octet vector."

@@ -55,6 +55,18 @@ output size.  OUTPUT must not alias OCTETS."
     (:gzip (gzip-compress-into output octets level))
     (:raw (deflate-raw-into output octets level))))
 
+(defun decompress-into (output octets &key (format :zlib))
+  "Decompress OCTETS into the caller-owned simple octet vector OUTPUT and
+return the number of octets written.  OUTPUT must have sufficient capacity,
+must not alias OCTETS, and its elements after the returned count are left
+unchanged."
+  (declare (type simple-array output octets))
+  (check-format format)
+  (case format
+    (:zlib (zlib-decompress-into output octets))
+    (:gzip (gzip-decompress-into output octets))
+    (:raw (inflate-raw-into output octets))))
+
 (defun decompress-octets (octets &key (format :zlib))
   "Decompress OCTETS, a stream in the given FORMAT (:zlib, :gzip or :raw).
   Returns a fresh octet vector."

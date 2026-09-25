@@ -192,13 +192,13 @@ BASE | EXTRA<<16."
   ;; fast         : 2^ROOT table; entry 0 = slow path (code longer than ROOT),
   ;;                else (LENGTH << 9) | SYMBOL for a code of LENGTH <= ROOT
   ;; index-root   : number of symbols with code length <= ROOT
-  (counts nil :read-only t :type (simple-array fixnum (*)))
-  (first nil :read-only t :type (simple-array fixnum (*)))
-  (offsets nil :read-only t :type (simple-array fixnum (*)))
-  (symbols nil :read-only t :type (simple-array fixnum (*)))
+  (counts nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
+  (first nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
+  (offsets nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
+  (symbols nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
   (max-length 0 :read-only t :type fixnum)
   (root 0 :read-only t :type fixnum)
-  (fast nil :read-only t :type (simple-array fixnum (*)))
+  (fast nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
   (index-root 0 :read-only t :type fixnum))
 
 ;;; Huffman decode runs once per output symbol; keep its table accessors
@@ -225,7 +225,8 @@ BASE | EXTRA<<16."
 
 (defun %count-code-lengths (lengths start n counts)
   "Count LENGTHS[START,START+N) into COUNTS, rejecting lengths above 15."
-  (declare (type (simple-array fixnum (*)) lengths counts)
+  (declare (type (simple-array fixnum (*)) lengths)
+           (type (simple-array (unsigned-byte 16) (*)) counts)
            (type fixnum start n)
            (optimize (speed 3) (safety 0)))
   (loop for i from start below (+ start n) do
@@ -238,7 +239,7 @@ BASE | EXTRA<<16."
 
 (defun %init-decode-bases (counts first offsets)
   "Verify Kraft's inequality; fill per-length OFFSETS and FIRST codes."
-  (declare (type (simple-array fixnum (*)) counts first offsets)
+  (declare (type (simple-array (unsigned-byte 16) (*)) counts first offsets)
            (optimize (speed 3) (safety 0)))
   ;; The shift count is statically 0..14 (L ranges 1..15), but that needs
   ;; asserting for the compiler to emit a single-direction shift.
@@ -256,7 +257,8 @@ BASE | EXTRA<<16."
 (defun %place-decode-symbols (lengths start n offsets symbols counts)
   "Single-pass counting placement ordered by (length, index); seeds CURSORS
 from OFFSETS.  Returns the longest used code length."
-  (declare (type (simple-array fixnum (*)) lengths offsets symbols counts)
+  (declare (type (simple-array fixnum (*)) lengths)
+           (type (simple-array (unsigned-byte 16) (*)) offsets symbols counts)
            (type fixnum start n)
            (optimize (speed 3) (safety 0)))
   (let ((cursors (make-array (1+ +max-code-length+) :element-type 'fixnum
@@ -278,14 +280,16 @@ from OFFSETS.  Returns the longest used code length."
 (defun %fill-decode-fast (counts first offsets symbols root)
   "Fill the 2^ROOT jump table keyed by LSB-first code; returns (VALUES
 FAST INDEX-ROOT), the table and the count of symbols it covers."
-  (declare (type (simple-array fixnum (*)) counts first offsets symbols)
+  (declare (type (simple-array (unsigned-byte 16) (*))
+                 counts first offsets symbols)
            (type fixnum root)
            (optimize (speed 3) (safety 0)))
   (let* ((size (ash 1 root))
-         (fast (make-array size :element-type 'fixnum :initial-element 0))
+         (fast (make-array size :element-type '(unsigned-byte 16)
+                           :initial-element 0))
          (index-root 0))
     (declare (type fixnum size index-root)
-             (type (simple-array fixnum (*)) fast))
+             (type (simple-array (unsigned-byte 16) (*)) fast))
     (loop for l from 1 to root do (incf index-root (aref counts l)))
     ;; for each length L <= ROOT, fill indices whose low L bits equal the
     ;; bit-reversed code of every length-L symbol, keyed by the hold value
@@ -312,11 +316,19 @@ table; longer codes fall back to a canonical walk."
   (declare (type (simple-array fixnum (*)) lengths)
            (type fixnum start n root)
            (optimize (speed 3) (safety 0)))
-  (let ((counts (make-array (1+ +max-code-length+) :element-type 'fixnum :initial-element 0))
-        (first (make-array (1+ +max-code-length+) :element-type 'fixnum :initial-element 0))
-        (offsets (make-array (1+ +max-code-length+) :element-type 'fixnum :initial-element 0))
-        (symbols (make-array n :element-type 'fixnum :initial-element 0)))
-    (declare (type (simple-array fixnum (*)) counts first offsets symbols))
+  (let ((counts (make-array (1+ +max-code-length+)
+                            :element-type '(unsigned-byte 16)
+                            :initial-element 0))
+        (first (make-array (1+ +max-code-length+)
+                           :element-type '(unsigned-byte 16)
+                           :initial-element 0))
+        (offsets (make-array (1+ +max-code-length+)
+                             :element-type '(unsigned-byte 16)
+                             :initial-element 0))
+        (symbols (make-array n :element-type '(unsigned-byte 16)
+                             :initial-element 0)))
+    (declare (type (simple-array (unsigned-byte 16) (*))
+                   counts first offsets symbols))
     (%count-code-lengths lengths start n counts)
     (%init-decode-bases counts first offsets)
     (let ((max-length (%place-decode-symbols lengths start n offsets
@@ -340,7 +352,7 @@ back to reading bits one at a time."
          (v (peek-bits-capped reader root))
          (entry (aref fast v)))
     (declare (type fixnum root v entry)
-             (type (simple-array fixnum (*)) fast))
+              (type (simple-array (unsigned-byte 16) (*)) fast))
     (if (zerop entry)
         ;; slow path: code longer than ROOT bits; consume the ROOT bits we
         ;; peeked, then walk the remaining bits, accumulating the canonical
@@ -352,7 +364,8 @@ back to reading bits one at a time."
               (index (hdt-index-root table))
               (len root))
           (declare (type fixnum code index len)
-                   (type (simple-array fixnum (*)) counts first symbols))
+                    (type (simple-array (unsigned-byte 16) (*))
+                           counts first symbols))
           (read-bits reader root)
           (block decode
             (loop do

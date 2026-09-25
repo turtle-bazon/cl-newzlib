@@ -494,6 +494,41 @@ bit/table locals; S is evaluated three times (pass a variable)."
           (return-from ,label (values buffer pos size)))
          (t (%emit-inflate-match-unchecked s1))))))
 
+(defmacro %inflate-growable-paired-loop (label)
+  `(loop do
+     (unless (<= (+ pos +inflate-headroom+) size)
+       (multiple-value-bind (nbuffer nsize)
+           (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
+         (setf buffer nbuffer size nsize)))
+     (let ((s1 (%inflate-decode-one lit lroot lfast)))
+       (declare (type fixnum s1))
+       (cond
+         ((< s1 256)
+          (let ((s2 (%inflate-decode-one lit lroot lfast)))
+            (declare (type fixnum s2))
+            (cond
+              ((< s2 256)
+               (setf (aref buffer pos) s1
+                     (aref buffer (1+ pos)) s2)
+               (incf pos 2))
+              ((= s2 256)
+               (setf (aref buffer pos) s1)
+               (incf pos)
+               (setf (br-accum reader) accum
+                     (br-nbits reader) nbits
+                     (br-pos reader) rpos)
+               (return-from ,label (values buffer pos size)))
+              (t
+               (setf (aref buffer pos) s1)
+               (incf pos)
+               (%emit-inflate-match-unchecked s2)))))
+         ((= s1 256)
+          (setf (br-accum reader) accum
+                (br-nbits reader) nbits
+                (br-pos reader) rpos)
+          (return-from ,label (values buffer pos size)))
+         (t (%emit-inflate-match-unchecked s1))))))
+
 (defun inflate-token-stream (reader buffer size pos lit dist &optional limit)
   "Decode literal/length-distance tokens into BUFFER[POS..] via LIT/DIST.
 Returns (VALUES BUFFER POS SIZE).  Reader state stays in locals (like C
@@ -513,22 +548,8 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
     ;; SAP consing), so no GC intervenes; output growth never moves RBUF.
     (with-pinned-input (rsap rbuf)
       (%with-inflate-tables (lit dist)
-        (loop
-          (unless (<= (+ pos +inflate-headroom+) size)
-            (multiple-value-bind (nbuffer nsize)
-                (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
-              (setf buffer nbuffer size nsize)))
-          (let ((s (%inflate-decode-one lit lroot lfast)))
-            (declare (type fixnum s))
-            (cond ((< s 256)
-                   (setf (aref buffer pos) s)
-                   (incf pos))
-                  ((= s 256)
-                   (setf (br-accum reader) accum
-                         (br-nbits reader) nbits
-                         (br-pos reader) rpos)
-                   (return (values buffer pos size)))
-                  (t (%emit-inflate-match-unchecked s)))))))))
+        (block decode-done
+          (%inflate-growable-paired-loop decode-done))))))
 
 (defun inflate-token-stream-bounded (reader buffer pos limit lit dist)
   "Decode a token stream into a caller-sized BUFFER without growth."

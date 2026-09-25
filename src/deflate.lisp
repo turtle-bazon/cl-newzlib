@@ -35,7 +35,7 @@
     (0 0)
     ((1 2 3) 4)
     ((4 5) 8)
-    ((6 7) 8)
+    ((6 7) 4)
     (8 32)
     (9 32)
     (otherwise (error 'newzlib-parameter-error
@@ -64,8 +64,8 @@
     (3 32)
     (4 16)
     (5 32)
-    (6 128)
-    (7 128)
+    (6 64)
+    (7 64)
     (8 258)
     (9 258)
     (otherwise (error 'newzlib-parameter-error
@@ -79,10 +79,10 @@
     (3 32)
     (4 16)
     (5 32)
-    (6 128)
-    (7 256)
-    (8 1024)
-    (9 4096)
+    (6 48)
+    (7 96)
+    (8 384)
+    (9 1536)
     (otherwise (error 'newzlib-parameter-error
                       :detail (format nil "invalid compression level ~A" level)))))
 
@@ -151,6 +151,21 @@ like zlib's INSERT_STRING match_head)."
                    hash-pos pos))
            (setf hash-pos -1))
        (setf hash-pos -1)))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*)) fixnum) fixnum)
+                 hash-3)
+         (ftype (function (fixnum fixnum
+                            (simple-array (unsigned-byte 32) (*))
+                            (simple-array (unsigned-byte 32) (*)))
+                          fixnum)
+                 insert-string-hash)
+         (ftype (function (fixnum fixnum fixnum fixnum fixnum)
+                          (values fixnum fixnum fixnum))
+                 %lm-limits)
+         (ftype (function ((simple-array (unsigned-byte 8) (*))
+                           fixnum fixnum fixnum)
+                          fixnum)
+                 %lm-extend))
 
 (declaim (inline %lm-limits %lm-candidate-ok-p %lm-extend %lm-bestpair-ok-p))
 #+(and sbcl cl-newzlib-le)

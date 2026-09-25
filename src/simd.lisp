@@ -108,7 +108,13 @@
     (declare (optimize (speed 3) (safety 0))
              (type (simple-array (unsigned-byte 8) (*)) input)
              (type fixnum a b limit))
-    (sb-simd-internals:instruction-set-case
-      (:avx2 (%leading-equal-octets/avx2 input a b limit))
-      (:sse4.1 (%leading-equal-octets/sse2 input a b limit))
-      (:x86-64 (leading-equal-octets/scalar input a b limit)))))
+    (the fixnum
+      (sb-simd-internals:instruction-set-case
+        (:avx2 (%leading-equal-octets/avx2 input a b limit))
+        (:sse4.1 (%leading-equal-octets/sse2 input a b limit))
+        (:x86-64 (leading-equal-octets/scalar input a b limit))))))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))
+                           fixnum fixnum fixnum)
+                          fixnum)
+                 leading-equal-octets))

@@ -44,6 +44,29 @@ cl-newzlib:zlib-compress / zlib-decompress  ; RFC 1950
 cl-newzlib:gzip-compress / gzip-decompress  ; RFC 1952
 ```
 
+## Allocation-free API
+
+When the output size is already known, the `into` variants decode or encode
+into a caller-owned buffer and return the number of octets written, with no
+per-call allocation on the hot path:
+
+```lisp
+(cl-newzlib:decompress-into buffer octets :format :zlib) ; => count
+(cl-newzlib:compress-into buffer octets :level 6 :mode :fast) ; => count
+```
+
+`buffer` must be a simple `(unsigned-byte 8)` vector that does not alias the
+input; elements past the returned count are left untouched.
+
+`decompress-into` requires capacity for the whole result and signals
+`newzlib-parameter-error` if `buffer` is too small.  `compress-into` instead
+needs worst-case capacity for the format, i.e. `(+ n (ash n -3))` plus the
+wrapper overhead (`+6` for zlib, `+18` for gzip, `+256` for raw) — or, at
+level 0, exactly `stored-block-octets n` plus that same overhead.  Like the
+one-shot calls, these raise `newzlib-parameter-error` for a bad or aliased
+buffer, and `newzlib-format-error` for corrupt input or a checksum mismatch,
+in which case `buffer` is left partially written.
+
 ## Streaming API
 
 ```lisp
@@ -69,8 +92,9 @@ in both directions, checksum comparison, window/boundary behaviour).
 (cl-newzlib-tests:run-tests)
 ```
 
-Requires a `libz.so` available to CFFI for the cross-validation tests; the
-rest of the suite runs without it.
+`cffi` is a hard dependency of the test system, and the cross-validation
+tests additionally need a loadable `libz.so.1`; each one is skipped when
+`zlib-available-p` is false, so the rest of the suite still runs.
 
 ## Status
 

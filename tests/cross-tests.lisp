@@ -93,6 +93,21 @@
                                 (format nil "z->cl gzip ~A level ~D" name level))))))
       (skip "system zlib not available")))
 
+(test cross-cl-fast-z-inflate
+  "Fast-mode output must decode under system zlib for every wrapper."
+  (if (zlib-available-p)
+      (let ((data (repetitive-data 20000)))
+        (dolist (format '(:raw :zlib :gzip))
+          (let* ((compressed (compress-octets data :format format
+                                                  :level 6 :mode :fast))
+                 (decoded (case format
+                           (:raw (z-raw-inflate compressed))
+                           (:zlib (z-zlib-inflate compressed))
+                           (:gzip (z-gzip-inflate compressed)))))
+            (is (equalp data decoded)
+                (format nil "cl fast->z ~A" format)))))
+      (skip "system zlib not available")))
+
 (test cross-known-vectors
   "Our compressor must byte-match system zlib for the empty input, which has
   no freedom in block selection."

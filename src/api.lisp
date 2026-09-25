@@ -22,38 +22,44 @@
   format)
 
 (defun raw-deflate (input &optional (start 0) (end (length input))
-                          (level +default-compression+))
+                          (level +default-compression+)
+                          (mode :standard))
   "Raw DEFLATE compression (RFC 1951), no wrapper."
-  (deflate-raw input start end level))
+  (deflate-raw input start end level mode))
 
 (defun raw-inflate (input &optional (start 0) (end (length input)))
   "Raw DEFLATE decompression (RFC 1951), no wrapper."
   (inflate-raw input start end))
 
 (defun compress-octets (octets &key (format :zlib)
-                               (level +default-compression+))
-  "Compress OCTETS.  FORMAT is :zlib (default), :gzip or :raw.  Returns a
-  fresh octet vector."
+                               (level +default-compression+)
+                               (mode :standard))
+  "Compress OCTETS.  FORMAT is :zlib (default), :gzip or :raw.  MODE :FAST
+  selects greedy matching.  Returns a fresh octet vector."
   (declare (type simple-array octets))
   (check-format format)
+  (check-compression-mode mode)
   (case format
-    (:zlib (zlib-compress octets 0 (length octets) level))
-    (:gzip (gzip-compress octets 0 (length octets) level))
-    (:raw (deflate-raw octets 0 (length octets) level))))
+    (:zlib (zlib-compress octets 0 (length octets) level mode))
+    (:gzip (gzip-compress octets 0 (length octets) level mode))
+    (:raw (deflate-raw octets 0 (length octets) level mode))))
 
 (defun compress-into (output octets &key (format :zlib)
-                                      (level +default-compression+))
+                                       (level +default-compression+)
+                                       (mode :standard))
   "Compress OCTETS into the caller-owned simple octet vector OUTPUT and return
 the number of octets written.  The first returned-count elements of OUTPUT
 are valid and its remaining elements are unchanged.  OUTPUT must have the
 format-specific worst-case capacity; level 0 requires only its exact stored
-output size.  OUTPUT must not alias OCTETS."
+output size.  OUTPUT must not alias OCTETS.  MODE :FAST selects greedy
+matching."
   (declare (type simple-array output octets))
   (check-format format)
+  (check-compression-mode mode)
   (case format
-    (:zlib (zlib-compress-into output octets level))
-    (:gzip (gzip-compress-into output octets level))
-    (:raw (deflate-raw-into output octets level))))
+    (:zlib (zlib-compress-into output octets level mode))
+    (:gzip (gzip-compress-into output octets level mode))
+    (:raw (deflate-raw-into output octets level mode))))
 
 (defun decompress-into (output octets &key (format :zlib))
   "Decompress OCTETS into the caller-owned simple octet vector OUTPUT and
@@ -110,10 +116,12 @@ unchanged."
           (read-sequence v s)
           v))))
 
-(defun compress (source &key (format :zlib) (level +default-compression+))
+(defun compress (source &key (format :zlib) (level +default-compression+)
+                        (mode :standard))
   "Compress the contents of SOURCE (a pathname or binary input stream).
   Returns a fresh octet vector in the given FORMAT."
-  (compress-octets (read-all-octets source) :format format :level level))
+  (compress-octets (read-all-octets source) :format format :level level
+                   :mode mode))
 
 (defun decompress (source &key (format :zlib))
   "Decompress the contents of SOURCE (a pathname or binary input stream).

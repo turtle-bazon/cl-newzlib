@@ -23,6 +23,12 @@
   (signals cl-newzlib:newzlib-parameter-error
     (cl-newzlib::check-compression-level :high)))
 
+(test check-compression-mode
+  (is (eq :standard (cl-newzlib::check-compression-mode :standard)))
+  (is (eq :fast (cl-newzlib::check-compression-mode :fast)))
+  (signals cl-newzlib:newzlib-parameter-error
+    (cl-newzlib::check-compression-mode :bogus)))
+
 (test ubyte8-ref-set
   (let ((v (cl-newzlib::make-octet-buffer 4)))
     (setf (aref v 0) 10)

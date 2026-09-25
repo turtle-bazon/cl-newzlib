@@ -55,6 +55,12 @@
            :detail (format nil "compression level ~A must be an integer in [0, 9]" level)))
   level)
 
+(defun check-compression-mode (mode)
+  (unless (member mode '(:standard :fast))
+    (error 'newzlib-parameter-error
+           :detail (format nil "unsupported compression mode ~S" mode)))
+  mode)
+
 (declaim (ftype (function (t fixnum) (unsigned-byte 8)) ubyte8-ref))
 (defun ubyte8-ref (vector index)
   "Fetch byte INDEX of VECTOR (a (unsigned-byte 8) vector) as an

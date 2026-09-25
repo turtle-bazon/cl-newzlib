@@ -50,12 +50,14 @@
       out)))
 
 (defun gzip-compress (input &optional (start 0) (end (length input))
-                            (level +default-compression+))
+                            (level +default-compression+)
+                            (mode :standard))
   "Compress INPUT[START,END) into the RFC 1952 gzip format.  Returns a fresh
 octet vector."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (check-compression-level level)
+  (check-compression-mode mode)
   (if (zerop level)
       (%gzip-stored-compress input start end level)
       (let* ((n (- end start))
@@ -68,7 +70,7 @@ octet vector."
                (let ((header (gzip-header-octets level))
                      (buf (bw-buffer writer)))
                  (replace buf header :end2 10))
-               (deflate-into-writer input start end writer level scratch)
+               (deflate-into-writer input start end writer level scratch mode)
                (flush-bits writer)
                (let* ((pos (bw-pos writer))
                       (crc (crc32 input start end))
@@ -87,8 +89,9 @@ octet vector."
                  out))
           (release-lz77-scratch scratch)))))
 
-(defun gzip-compress-into (output input level)
+(defun gzip-compress-into (output input level &optional (mode :standard))
   (check-compression-level level)
+  (check-compression-mode mode)
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error
            :detail "input must be an (unsigned-byte 8) vector"))
@@ -110,7 +113,7 @@ octet vector."
              (let ((header (gzip-header-octets level))
                    (buf (bw-buffer writer)))
                (replace buf header :end2 10))
-             (deflate-into-writer input 0 n writer level scratch)
+             (deflate-into-writer input 0 n writer level scratch mode)
              (flush-bits writer)
              (let* ((pos (bw-pos writer))
                     (crc (crc32 input))

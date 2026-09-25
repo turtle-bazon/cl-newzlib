@@ -51,12 +51,14 @@
       out)))
 
 (defun zlib-compress (input &optional (start 0) (end (length input))
-                            (level +default-compression+))
+                            (level +default-compression+)
+                            (mode :standard))
   "Compress INPUT[START,END) into the RFC 1950 zlib format (header + DEFLATE
 data + Adler-32).  Returns a fresh octet vector."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (check-compression-level level)
+  (check-compression-mode mode)
   (if (zerop level)
       (%zlib-stored-compress input start end level)
       (let* ((n (- end start))
@@ -70,7 +72,7 @@ data + Adler-32).  Returns a fresh octet vector."
                      (buf (bw-buffer writer)))
                  (setf (aref buf 0) (aref header 0)
                        (aref buf 1) (aref header 1)))
-               (deflate-into-writer input start end writer level scratch)
+               (deflate-into-writer input start end writer level scratch mode)
                (flush-bits writer)
                (let* ((pos (bw-pos writer))
                       (checksum (adler32 input start end))
@@ -84,8 +86,9 @@ data + Adler-32).  Returns a fresh octet vector."
                  out))
           (release-lz77-scratch scratch)))))
 
-(defun zlib-compress-into (output input level)
+(defun zlib-compress-into (output input level &optional (mode :standard))
   (check-compression-level level)
+  (check-compression-mode mode)
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error
            :detail "input must be an (unsigned-byte 8) vector"))
@@ -108,7 +111,7 @@ data + Adler-32).  Returns a fresh octet vector."
                    (buf (bw-buffer writer)))
                (setf (aref buf 0) (aref header 0)
                      (aref buf 1) (aref header 1)))
-             (deflate-into-writer input 0 n writer level scratch)
+             (deflate-into-writer input 0 n writer level scratch mode)
              (flush-bits writer)
              (let* ((pos (bw-pos writer))
                     (checksum (adler32 input)))

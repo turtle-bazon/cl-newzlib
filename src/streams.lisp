@@ -14,15 +14,19 @@
             (:copier nil))
   (buffer nil :type (or null (array (unsigned-byte 8) (*)))) ; growable octet buffer
   (level +default-compression+ :type fixnum)
+  (mode :standard :type keyword)
   (finished nil :type boolean)
   (result nil :type (or null simple-array)))
 
-(defun make-deflate-stream (&key (level +default-compression+))
-  "Create a compression stream at LEVEL.  Feed it with
-  DEFLATE-STREAM-WRITE, then produce the compressed output with
-  DEFLATE-STREAM-FINISH."
+(defun make-deflate-stream (&key (level +default-compression+)
+                                (mode :standard))
+  "Create a compression stream at LEVEL.  MODE :FAST selects greedy
+  matching.  Feed it with DEFLATE-STREAM-WRITE, then produce the compressed
+  output with DEFLATE-STREAM-FINISH."
   (check-compression-level level)
-  (%make-deflate-stream :buffer (make-growable-buffer 1024) :level level))
+  (check-compression-mode mode)
+  (%make-deflate-stream :buffer (make-growable-buffer 1024)
+                        :level level :mode mode))
 
 (defun deflate-stream-write (stream octets &optional (start 0) (end (length octets)))
   "Append OCTETS[START,END) to the input of STREAM."
@@ -44,7 +48,8 @@
            (input (if (typep buffer '(simple-array (unsigned-byte 8) (*)))
                       buffer
                       (subseq buffer 0 n))))
-      (setf (ds-result stream) (deflate-raw input 0 n (ds-level stream))
+      (setf (ds-result stream)
+            (deflate-raw input 0 n (ds-level stream) (ds-mode stream))
             (ds-finished stream) t)))
   (ds-result stream))
 

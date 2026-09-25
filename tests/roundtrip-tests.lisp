@@ -53,6 +53,22 @@
                                (is (equalp data d)
                                    (format nil "roundtrip ~A level ~D ~A" name level format)))))))
 
+(test fast-mode-roundtrip-all-formats
+  (loop for format in '(:raw :zlib :gzip)
+        for level in '(1 6 9)
+        do (let* ((data (repetitive-data 20000))
+                  (compressed (compress-octets data :format format
+                                                 :level level :mode :fast))
+                  (capacity (+ (length data) (ash (length data) -3) 300))
+                  (output (make-array capacity :element-type '(unsigned-byte 8)
+                                       :initial-element #xA5))
+                  (count (compress-into output data :format format
+                                         :level level :mode :fast)))
+           (is (= count (length compressed)))
+           (is (equalp compressed (subseq output 0 count)))
+           (is (equalp data (decompress-octets compressed :format format)))
+           (is (= #xA5 (aref output count))))))
+
 (test compress-into-reusable-output
   (loop for format in '(:raw :zlib :gzip)
         for level in '(0 1 6 9)
@@ -162,6 +178,8 @@
   (signals cl-newzlib:newzlib-parameter-error
     (compress-octets (small-data) :format :bogus))
   (signals cl-newzlib:newzlib-parameter-error
+    (compress-octets (small-data) :mode :bogus))
+  (signals cl-newzlib:newzlib-parameter-error
     (decompress-octets (small-data) :format :bogus))
   (signals cl-newzlib:newzlib-parameter-error
     (compress-octets (small-data) :format :zlib :level 12)))
@@ -212,6 +230,13 @@
       (is (equalp data d))
       (deflate-stream-end ds))))
 
+(test deflate-stream-fast-mode
+  (let* ((data (repetitive-data 100000))
+         (ds (make-deflate-stream :level 6 :mode :fast)))
+    (deflate-stream-write ds data)
+    (let ((c (deflate-stream-finish ds)))
+      (is (equalp data (decompress-octets c :format :raw))))
+    (deflate-stream-end ds)))
 (test deflate-stream-empty
   (let* ((ds (make-deflate-stream))
          (c (deflate-stream-finish ds)))

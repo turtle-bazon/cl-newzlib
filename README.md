@@ -33,7 +33,8 @@ Both are available through Quicklisp.
 binary stream, and dispatch on the `:format` keyword (`:zlib`, `:gzip`,
 `:raw`).  Compression level is selectable with
 `:level` (`+no-compression+`, `+default-compression+`, `+best-compression+`
-or the `compression-level-*` constants).
+or the `compression-level-*` constants).  Pass `:mode :fast` to select the
+faster greedy matcher, which trades compression ratio for throughput.
 
 Format-specific wrappers:
 
@@ -73,4 +74,4 @@ rest of the suite runs without it.
 
 ## Status
 
-The full suite passes: 1421 checks, 0 failures.
+The full suite passes: 1494 checks, 0 failures.

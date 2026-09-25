@@ -620,7 +620,8 @@ possibly-grown token vector and its capacity."
                                              :initial-element #xFFFFFFFF))
                            (prev (make-array +window-size+
                                              :element-type '(unsigned-byte 32)
-                                             :initial-element #xFFFFFFFF)))
+                                             :initial-element #xFFFFFFFF))
+                           (mode :standard))
   "Run LZ77 over INPUT[START,END), filling the packed token buffer and the
 symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
   (declare (optimize (speed 3) (safety 0))
@@ -629,10 +630,12 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end level token-capacity))
+  (check-compression-mode mode)
   (multiple-value-bind (nsym extra-bits tokens token-capacity)
       (%lz77-search input start end
                     (nice-length level) (good-length level (- end start))
-                    (chain-limit level (- end start)) (lazy-length level) (> level 3)
+                    (chain-limit level (- end start)) (lazy-length level)
+                    (and (not (eq mode :fast)) (> level 3))
                     tokens token-capacity head prev lit-freq dist-freq)
     (multiple-value-bind (final-nsym tokens token-capacity)
         (finish-token-stream tokens token-capacity lit-freq nsym)
@@ -1059,13 +1062,14 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
                             lit-codes lit-lengths dist-codes dist-lengths
                             nbl hlit hdist hclen)))))))
 
-(defun deflate-into-writer (input start end writer level &optional scratch)
+(defun deflate-into-writer (input start end writer level &optional scratch (mode :standard))
   "Compress INPUT[START,END) into WRITER as one DEFLATE stream.  Level 0
 emits stored blocks; higher levels pick the cheapest block encoding."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type bit-writer writer)
            (type fixnum start end level)
            (type (or null lz77-scratch) scratch))
+  (check-compression-mode mode)
   (let ((n (- end start)))
     (declare (type fixnum n))
     (if (zerop level)
@@ -1082,7 +1086,7 @@ emits stored blocks; higher levels pick the cheapest block encoding."
                      (run-lz77 input start end level
                                (lzs-tokens scratch) (lzs-token-capacity scratch)
                                (lzs-lit-freq scratch) (lzs-dist-freq scratch)
-                               (lzs-head scratch) (lzs-prev scratch))
+                               (lzs-head scratch) (lzs-prev scratch) mode)
                    (declare (type fixnum nsym extra-bits token-capacity))
                    (setf (lzs-tokens scratch) tokens
                          (lzs-token-capacity scratch) token-capacity)
@@ -1094,10 +1098,12 @@ emits stored blocks; higher levels pick the cheapest block encoding."
             (when owned
               (release-lz77-scratch scratch)))))))
 
-(defun deflate-raw (input &optional (start 0) (end (length input)) (level 6))
+(defun deflate-raw (input &optional (start 0) (end (length input)) (level 6)
+                       (mode :standard))
   "Compress INPUT[START,END) with raw DEFLATE (no zlib/gzip header) at LEVEL.
-Returns a fresh octet vector."
+MODE :FAST selects greedy matching.  Returns a fresh octet vector."
   (check-compression-level level)
+  (check-compression-mode mode)
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
   (let ((n (- end start)))
@@ -1113,7 +1119,7 @@ Returns a fresh octet vector."
                (writer (reset-bit-writer (lzs-writer scratch) bound)))
           (unwind-protect
                (progn
-                 (deflate-into-writer input start end writer level scratch)
+                 (deflate-into-writer input start end writer level scratch mode)
                  (writer-bytes writer))
             (release-lz77-scratch scratch))))))
 
@@ -1127,8 +1133,9 @@ Returns a fresh octet vector."
                            (length buffer) required)))
   buffer)
 
-(defun deflate-raw-into (output input level)
+(defun deflate-raw-into (output input level &optional (mode :standard))
   (check-compression-level level)
+  (check-compression-mode mode)
   (unless (typep input '(simple-array (unsigned-byte 8) (*)))
     (error 'newzlib-parameter-error
            :detail "input must be an (unsigned-byte 8) vector"))
@@ -1149,7 +1156,7 @@ Returns a fresh octet vector."
           (let ((scratch (acquire-lz77-scratch (1+ n))))
             (unwind-protect
                  (progn
-                   (deflate-into-writer input 0 n writer level scratch)
+                   (deflate-into-writer input 0 n writer level scratch mode)
                    (flush-bits writer))
               (release-lz77-scratch scratch))))
       (bw-pos writer))))

@@ -181,23 +181,22 @@ This lets WRITE-BITS batch several small codes before touching memory."
 
 (declaim (inline write-bits))
 (defun write-bits (writer bits count)
-  "Append the low COUNT bits of BITS to WRITER, LSB-first.  COUNT must be
-at most 16 (the largest count DEFLATE ever emits is a stored block's
-16-bit length); the accumulator invariant keeps NBITS below 8 between
-calls, so the shifted value always fits in 24 bits and no bignum guard is
-needed."
+  "Append the low COUNT bits of BITS to WRITER, LSB-first.  COUNT must be at
+most 16 (the largest count DEFLATE ever emits is a stored block's 16-bit
+length).  BITS must already fit in COUNT bits: every caller passes either a
+canonical Huffman code (by construction shorter than its length), a DEFLATE
+extra-bits value (bounded by the code's bit count), or a header field.
+Skipping the LDB that used to truncate BITS removes a five-instruction
+variable-shift mask from this per-symbol hot path."
   (declare (optimize (speed 3) (safety 0))
-           (type (unsigned-byte 64) bits)
+           (type (unsigned-byte 16) bits)
            (type (integer 0 16) count))
   (let ((nbits (bw-nbits writer)))
     (declare (type (unsigned-byte 5) nbits))
     (setf (bw-accum writer)
           (definitely-the
               (unsigned-byte 64)
-            (logior (bw-accum writer)
-                    (ash (definitely-the (unsigned-byte 16)
-                           (ldb (byte count 0) bits))
-                         nbits)))
+            (logior (bw-accum writer) (ash bits nbits)))
           (bw-nbits writer) (+ nbits count))
     (when (>= (+ nbits count) 32)
       (flush-complete-words writer)))

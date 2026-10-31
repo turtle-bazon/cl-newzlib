@@ -910,53 +910,89 @@ BL-FREQ.  Returns (VALUES NBL EXTRA-BITS)."
               (setf max-count mx min-count mn)))))
       (values nbl extra-bits))))
 
-(declaim (inline %emit-bl-header %emit-bl-symbols))
-
-(defun %emit-bl-header (writer bfinal hlit hdist hclen)
-  "Write a dynamic block's 3-bit type plus HLIT/HDIST/HCLEN counts."
-  (declare (type fixnum hlit hdist hclen))
-  (write-bits writer (if bfinal 1 0) 1)
-  (write-bits writer 2 2)
-  (write-bits writer (- hlit 257) 5)
-  (write-bits writer (- hdist 1) 5)
-  (write-bits writer (- hclen 4) 4))
-
-(defun %emit-bl-symbols (writer bl-sym bl-extra bl-codes bl-lengths nbl hclen)
-  "Write the code-length order table then the NBL code-length symbols."
-  (declare (optimize (speed 3) (safety 0))
-           (type (simple-array fixnum (*)) bl-sym bl-extra bl-codes bl-lengths)
-           (type fixnum nbl hclen))
-  (loop for i below hclen do
-    (write-bits writer (aref bl-lengths (aref +code-length-order+ i)) 3))
-  (loop for i below nbl do
-    (let ((s (aref bl-sym i)))
-      (write-bits writer (aref bl-codes s) (aref bl-lengths s))
-      (case s
-        (16 (write-bits writer (aref bl-extra i) 2))
-        (17 (write-bits writer (aref bl-extra i) 3))
-        (18 (write-bits writer (aref bl-extra i) 7))
-        (otherwise nil)))))
-
 (defun emit-dynamic-block (writer tokens nsym bfinal
                             lit-codes lit-lengths dist-codes dist-lengths
                             bl-sym bl-extra bl-codes bl-lengths nbl
                             hlit hdist hclen)
+  "Write a dynamic block with the bit accumulator in local variables, so
+ACCUM/NBITS stay in registers instead of round-tripping two writer-struct
+fields on every code."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array fixnum (*)) lit-codes lit-lengths dist-codes
                               dist-lengths bl-sym bl-extra bl-codes bl-lengths)
            (type fixnum nsym nbl hlit hdist hclen))
-  (%emit-bl-header writer bfinal hlit hdist hclen)
-  (%emit-bl-symbols writer bl-sym bl-extra bl-codes bl-lengths nbl hclen)
-  (loop for i below nsym do
-    (let* ((token (aref tokens i))
-           (s (token-symbol token)))
-      (if (> s 256)
-          (%emit-coded-token writer s (token-distance-code token)
-                             (token-length token) (token-distance token)
-                             lit-codes lit-lengths dist-codes dist-lengths)
-          (%emit-coded-token writer s 0 0 0
-                             lit-codes lit-lengths dist-codes dist-lengths)))))
+  (let ((accum (bw-accum writer))
+        (nbits (bw-nbits writer))
+        (pos (bw-pos writer))
+        (buffer (bw-buffer writer))
+        (size (bw-size writer)))
+    (declare (type (unsigned-byte 64) accum)
+             (type fixnum nbits pos size)
+             (type (simple-array (unsigned-byte 8) (*)) buffer))
+    (macrolet ((flush-word ()
+                 `(progn
+                    (when (>= pos size)
+                      (setq buffer (grow-buffer buffer size)
+                            size (* 2 size)))
+                    #+(and sbcl cl-newzlib-le)
+                    (setf (sb-sys:sap-ref-32 (sb-sys:vector-sap buffer) pos)
+                          (ldb (byte 32 0) accum))
+                    #-(and sbcl cl-newzlib-le)
+                    (setf (aref buffer pos) (logand accum #xFF)
+                          (aref buffer (+ pos 1)) (logand (ash accum -8) #xFF)
+                          (aref buffer (+ pos 2)) (logand (ash accum -16) #xFF)
+                          (aref buffer (+ pos 3)) (logand (ash accum -24) #xFF))
+                    (setq accum (ash accum -32)
+                          nbits (- nbits 32)
+                          pos (+ pos 4))))
+               (emit (bits count)
+                 `(let ((c ,count))
+                    (declare (type (integer 0 16) c))
+                    (setq accum (logior accum
+                                        (ash (definitely-the (unsigned-byte 16) ,bits)
+                                             (definitely-the (unsigned-byte 5) nbits)))
+                          nbits (+ nbits c))
+                    (when (>= nbits 32) (flush-word)))))
+      (emit (if bfinal 1 0) 1)
+      (emit 2 2)
+      (emit (- hlit 257) 5)
+      (emit (- hdist 1) 5)
+      (emit (- hclen 4) 4)
+      (loop for i below hclen do
+        (emit (aref bl-lengths (aref +code-length-order+ i)) 3))
+      (loop for i below nbl do
+        (let ((s (aref bl-sym i)))
+          (emit (aref bl-codes s) (aref bl-lengths s))
+          (case s
+            (16 (emit (aref bl-extra i) 2))
+            (17 (emit (aref bl-extra i) 3))
+            (18 (emit (aref bl-extra i) 7)))))
+      (loop for i below nsym do
+        (let* ((token (aref tokens i))
+               (s (token-symbol token)))
+          (if (> s 256)
+              (progn
+                (emit (aref lit-codes s) (aref lit-lengths s))
+                (let* ((be (length-base+extra (- s 257)))
+                       (n (ash be -16)))
+                  (declare (type (unsigned-byte 32) be) (type fixnum n))
+                  (when (plusp n)
+                    (emit (- (token-length token) (logand be #xFFFF)) n)))
+                (let* ((dd (token-distance-code token))
+                       (bde (dist-base+extra dd))
+                       (dn (ash bde -16)))
+                  (declare (type (unsigned-byte 32) bde) (type fixnum dn))
+                  (emit (aref dist-codes dd) (aref dist-lengths dd))
+                  (when (plusp dn)
+                    (emit (- (token-distance token) (logand bde #xFFFF)) dn))))
+              (emit (aref lit-codes s) (aref lit-lengths s)))))
+      (setf (bw-accum writer) accum
+            (bw-nbits writer) nbits
+            (bw-pos writer) pos
+            (bw-buffer writer) buffer
+            (bw-size writer) size)
+      (flush-pending-bytes writer))))
 
 ;;; ------------------------------------------------------------------
 ;;; Compressor driver

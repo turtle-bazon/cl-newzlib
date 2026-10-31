@@ -415,6 +415,25 @@ one-shot timings."
                                 (time-reps thunk reps)))))
     (values (median times) (reduce #'min times) reps)))
 
+(defun measure-pair (thunk-a thunk-b &key (target 0.2) (samples 3) (max-reps 1000))
+  "Time THUNK-A and THUNK-B in alternating samples and return their medians
+as two values.  Alternating the two sides keeps CPU-frequency and scheduler
+drift from biasing the A/B ratio."
+  (funcall thunk-a)
+  (funcall thunk-b)
+  (let* ((one-a (max (time-reps thunk-a 1) 1e-7))
+         (one-b (max (time-reps thunk-b 1) 1e-7))
+         (reps-a (max 1 (min max-reps (floor target one-a))))
+         (reps-b (max 1 (min max-reps (floor target one-b))))
+         (times-a '())
+         (times-b '()))
+    (dotimes (i samples)
+      (declare (ignore i))
+      (full-gc)
+      (push (time-reps thunk-a reps-a) times-a)
+      (push (time-reps thunk-b reps-b) times-b))
+    (values (median times-a) (median times-b))))
+
 (defun mib-per-second (octets seconds)
   (/ octets 1048576.0 seconds))
 
@@ -485,54 +504,49 @@ one-shot timings."
            (let ((zi (make-zinflater z-compressed window-bits (+ n 64)))
                  (d-out (make-array n :element-type '(unsigned-byte 8))))
              (unwind-protect
-                  (let ((cl-comp-core (measure
-                                       (lambda ()
-                                         (cl-newzlib:compress-into
-                                          cl-out data :format format
-                                          :level level :mode mode))
-                                       :target target :samples samples))
-                        (z-comp-core (measure
-                                      (lambda () (zcompressor-run zc))
-                                      :target target :samples samples))
-                        (cl-decomp-core (measure
-                                         (lambda ()
-                                           (cl-newzlib:decompress-into
-                                            d-out z-compressed :format format))
-                                         :target target :samples samples))
-                        (z-decomp-core (measure
-                                        (lambda () (zinflater-run zi))
-                                        :target target :samples samples))
-                        (cl-comp-1 (measure
-                                    (lambda ()
-                                      (cl-newzlib:compress-octets
-                                       data :format format
-                                       :level level :mode mode))
-                                    :target target :samples samples))
-                        (z-comp-1 (measure
-                                   (lambda () (zcompress-fresh zc level window-bits))
-                                   :target target :samples samples))
-                        (cl-decomp-1 (measure
-                                      (lambda ()
-                                        (cl-newzlib:decompress-octets
-                                         z-compressed :format format))
-                                      :target target :samples samples))
-                        (z-decomp-1 (measure
-                                     (lambda ()
-                                       (zinflate-fresh zi window-bits))
-                                     :target target :samples samples)))
-                    (make-bench-result
-                     :level level
-                     :mode mode
-                     :cl-size cl-size
-                     :z-size z-size
-                     :cl-comp cl-comp-core
-                     :z-comp z-comp-core
-                     :cl-decomp cl-decomp-core
-                     :z-decomp z-decomp-core
-                     :cl-comp-1 cl-comp-1
-                     :z-comp-1 z-comp-1
-                     :cl-decomp-1 cl-decomp-1
-                     :z-decomp-1 z-decomp-1))
+                  (multiple-value-bind (cl-comp-core z-comp-core)
+                      (measure-pair
+                       (lambda ()
+                         (cl-newzlib:compress-into
+                          cl-out data :format format
+                          :level level :mode mode))
+                       (lambda () (zcompressor-run zc))
+                       :target target :samples samples)
+                    (multiple-value-bind (cl-decomp-core z-decomp-core)
+                        (measure-pair
+                         (lambda ()
+                           (cl-newzlib:decompress-into
+                            d-out z-compressed :format format))
+                         (lambda () (zinflater-run zi))
+                         :target target :samples samples)
+                      (multiple-value-bind (cl-comp-1 z-comp-1)
+                          (measure-pair
+                           (lambda ()
+                             (cl-newzlib:compress-octets
+                              data :format format
+                              :level level :mode mode))
+                           (lambda () (zcompress-fresh zc level window-bits))
+                           :target target :samples samples)
+                        (multiple-value-bind (cl-decomp-1 z-decomp-1)
+                            (measure-pair
+                             (lambda ()
+                               (cl-newzlib:decompress-octets
+                                z-compressed :format format))
+                             (lambda () (zinflate-fresh zi window-bits))
+                             :target target :samples samples)
+                          (make-bench-result
+                           :level level
+                           :mode mode
+                           :cl-size cl-size
+                           :z-size z-size
+                           :cl-comp cl-comp-core
+                           :z-comp z-comp-core
+                           :cl-decomp cl-decomp-core
+                           :z-decomp z-decomp-core
+                           :cl-comp-1 cl-comp-1
+                           :z-comp-1 z-comp-1
+                           :cl-decomp-1 cl-decomp-1
+                           :z-decomp-1 z-decomp-1)))))
                (free-zinflater zi))))
       (free-zcompressor zc))))
 

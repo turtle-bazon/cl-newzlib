@@ -8,24 +8,36 @@
 #+(and sbcl x86-64)
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (handler-case (require :sb-simd) (error () nil))
-  ;; These features mean "this implementation was compiled into the image",
-  ;; not "this CPU supports it".  Every AVX2/PCLMUL entry point is selected
-  ;; again at runtime (and on image restart), so an image built on a machine
-  ;; without AVX2 can carry the code and enable it later on an AVX2 host.
-  (when (find-package :sb-simd)
-    (pushnew :newzlib-simd *features*))
-  (when (find-package :sb-simd-avx2)
-    (pushnew :newzlib-avx2 *features*))
-  (when (find-package :sb-simd-sse2)
-    (pushnew :newzlib-pclmul *features*)))
-
-(defun avx2-usable-p ()
-  "True only when the CPU implements AVX2 *and* the OS has enabled the
-YMM state.  SBCL's runtime sets AVX2_SUPPORTED after CPUID plus XGETBV, so
-this covers the VM/old-kernel case that a bare CPUID check misses."
-  #+sbcl (ignore-errors
-           (plusp (sb-alien:extern-alien "avx2_supported" sb-alien:int)))
-  #-sbcl nil)
+  (defun avx2-usable-p ()
+    "True only when AVX2 is implemented and the OS has enabled YMM state.
+SBCL's runtime sets AVX2_SUPPORTED after CPUID plus XGETBV.  This is also
+consulted at compile time: compiling AVX2 code on an AVX2-less host is not
+safe, because SBCL may constant-fold sb-simd AVX2 constructors and execute
+them during compilation."
+    (ignore-errors
+      (plusp (sb-alien:extern-alien "avx2_supported" sb-alien:int))))
+  (let* ((pkg (find-package :sb-simd-internals))
+         (find-set (and pkg (find-symbol "FIND-INSTRUCTION-SET" pkg)))
+         (avail (and pkg (find-symbol "INSTRUCTION-SET-AVAILABLE-P" pkg)))
+         (cpuid (and pkg (find-symbol "CPUID" pkg))))
+    (flet ((supports-p (name)
+             (and find-set avail
+                  (ignore-errors
+                    (funcall avail (funcall find-set name))))))
+      ;; SSE4.1 is compile-time gated too: no SIMD source is compiled on a
+      ;; CPU that cannot execute it.
+      (when (supports-p :sse4.1)
+        (pushnew :newzlib-simd *features*)
+        (when (and (find-package :sb-simd-avx2)
+                   (avx2-usable-p))
+          (pushnew :newzlib-avx2 *features*))))
+    ;; PCLMULQDQ is independent of AVX2; probe CPUID leaf 1 ECX bit 1.
+    ;; This code is runtime-gated, so compiling it is safe.
+    (when (and cpuid (fboundp cpuid)
+               (ignore-errors
+                 (and (>= (funcall cpuid 0) 1)
+                      (logbitp 1 (nth-value 2 (funcall cpuid 1))))))
+      (pushnew :newzlib-pclmul *features*))))
 
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))

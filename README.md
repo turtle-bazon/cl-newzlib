@@ -128,15 +128,15 @@ Reported `cl/zlib` values are cl-newzlib's throughput divided by zlib's,
 so values above 1 mean cl-newzlib is faster.  `--mode fast` changes only
 cl-newzlib's matcher; zlib is always run with its default strategy.
 
-SIMD code paths (AVX2, SSE4.1, PCLMULQDQ) are compiled when the sb-simd
-packages are available, regardless of the build machine's CPU, but every
-AVX2/PCLMUL entry point is selected again at runtime.  On a non-AVX2 host
-the compiled AVX2 code stays inert and the SSE/scalar path is used; an
-image built on a non-AVX2 host can enable the compiled AVX2 paths when it
-is restarted on an AVX2 CPU.  The Adler-32 and CRC-32 hooks run on every
-image startup and re-check the current CPU; the inflate match-extension
-dispatch is updated by sb-simd on restart.  No AVX2 code is executed at
-load time when the CPU lacks it.
+AVX2 and SSE4.1 source is compiled only when the build machine can execute
+it, because SBCL may constant-fold sb-simd AVX2 constructors during
+compilation.  PCLMULQDQ code is independent of AVX state and is compiled
+when sb-simd is available.  Every compiled AVX2/PCLMUL entry point is
+selected again at runtime: an image built on an AVX2 machine disables the
+AVX2 paths when restarted on a lesser CPU and re-enables them when moved
+back.  A build made on a non-AVX2 machine contains no AVX2 code, so it
+cannot gain it later without recompiling on an AVX2 machine.  The AVX2
+check includes OS YMM state (SBCL's XGETBV-backed flag), not just CPUID.
 
 On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
 text/binary inputs), compression is now about 1.1-1.5x zlib at levels
@@ -146,4 +146,4 @@ around 0.9-1.0x.  Binary inflate is the remaining small gap.
 
 ## Status
 
-The full suite passes: 1561 checks, 0 failures on SBCL 2.6.7 and 2.6.9.
+The full suite passes on SBCL 2.6.7 and 2.6.9 (1567 checks with AVX2 compiled, 1563 without).

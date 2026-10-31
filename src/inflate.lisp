@@ -437,19 +437,19 @@ live yet and will be overwritten)."
   #+(and sbcl cl-newzlib-le)
   (when osap
     (cond
-      ((and (<= length 8) (>= distance 8)
+      ((and (<= length 8) (<= length distance)
             (<= (+ pos 8) (the fixnum limit)))
        (setf (sb-sys:sap-ref-64 osap pos)
              (sb-sys:sap-ref-64 osap src))
        (return-from %copy-inflate-match (+ pos length)))
-      ((and (<= length 16) (>= distance 16)
+      ((and (<= length 16) (<= length distance)
             (<= (+ pos 16) (the fixnum limit)))
        (setf (sb-sys:sap-ref-64 osap pos)
              (sb-sys:sap-ref-64 osap src)
              (sb-sys:sap-ref-64 osap (+ pos 8))
              (sb-sys:sap-ref-64 osap (+ src 8)))
        (return-from %copy-inflate-match (+ pos length)))
-      ((and (<= length 32) (>= distance 32)
+      ((and (<= length 32) (<= length distance)
             (<= (+ pos 32) (the fixnum limit)))
        (setf (sb-sys:sap-ref-64 osap pos)
              (sb-sys:sap-ref-64 osap src)
@@ -460,7 +460,7 @@ live yet and will be overwritten)."
              (sb-sys:sap-ref-64 osap (+ pos 24))
              (sb-sys:sap-ref-64 osap (+ src 24)))
        (return-from %copy-inflate-match (+ pos length)))
-      ((and (<= length 64) (>= distance 64)
+      ((and (<= length 64) (<= length distance)
             (<= (+ pos 64) (the fixnum limit)))
        (setf (sb-sys:sap-ref-64 osap pos)
              (sb-sys:sap-ref-64 osap src)
@@ -595,9 +595,32 @@ are the per-table low-bit masks for the literal and distance roots."
           (t (%emit-inflate-match s t))))))
 
 (defmacro %inflate-bounded-unchecked-loop (while label)
-  "Single-symbol loop for the region with +INFLATE-HEADROOM+ to spare."
+  "Entry loop for the region with +INFLATE-HEADROOM+ to spare.  A single
+fast-table lookup dispatches literals and matches inline (literals and
+matches share the same decode), and the loop condition guarantees NBITS >=
+15 plus a code length no larger than the table root (<= 12), so neither the
+per-symbol refill nor the truncated-input check runs here.  The outer form
+handles only long codes (table entry 0), low bit counts and end-of-block."
   `(loop do
      (unless ,while (return))
+     (loop while (and (>= nbits 15) ,while) do
+       (let ((entry (aref lfast (logand accum lmask))))
+         (declare (type fixnum entry))
+         (when (zerop entry) (return))
+         (let ((s (logand entry #x1FF)))
+           (declare (type fixnum s))
+           (when (= s 256) (return))
+           (let ((clen (ash entry -9)))
+             (declare (type fixnum clen))
+             (setf accum (definitely-the (unsigned-byte 64)
+                           (ash accum (- clen)))
+                   nbits (- nbits clen))
+             (if (< s 256)
+                 (progn
+                   #+sbcl (setf (sb-sys:sap-ref-8 osap pos) s)
+                   #-sbcl (setf (aref buffer pos) s)
+                   (incf pos))
+                 (%emit-inflate-match-unchecked s))))))
      (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
        (declare (type fixnum s))
        (cond
@@ -611,37 +634,6 @@ are the per-table low-bit masks for the literal and distance roots."
                 (br-pos reader) rpos)
           (return-from ,label (values buffer pos size)))
          (t (%emit-inflate-match-unchecked s))))))
-
-(defmacro %inflate-bounded-paired-loop (while label)
-  `(loop ,@(if while (list while) nil) do
-     (let ((s1 (%inflate-decode-one-full lit lroot lfast lmask)))
-       (declare (type fixnum s1))
-       (cond
-         ((< s1 256)
-          (let ((s2 (%inflate-decode-one-full lit lroot lfast lmask)))
-            (declare (type fixnum s2))
-            (cond
-              ((< s2 256)
-               (setf (aref buffer pos) s1
-                     (aref buffer (1+ pos)) s2)
-               (incf pos 2))
-              ((= s2 256)
-               (setf (aref buffer pos) s1)
-               (incf pos)
-               (setf (br-accum reader) accum
-                     (br-nbits reader) nbits
-                     (br-pos reader) rpos)
-               (return-from ,label (values buffer pos size)))
-              (t
-               (setf (aref buffer pos) s1)
-               (incf pos)
-               (%emit-inflate-match-unchecked s2)))))
-         ((= s1 256)
-          (setf (br-accum reader) accum
-                (br-nbits reader) nbits
-                (br-pos reader) rpos)
-          (return-from ,label (values buffer pos size)))
-         (t (%emit-inflate-match-unchecked s1))))))
 
 (defmacro %inflate-growable-paired-loop (label)
   `(loop do
@@ -713,9 +705,13 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
   (let ((accum (br-accum reader)) (nbits (br-nbits reader))
         (rpos (br-pos reader)) (rend (br-end reader))
         (rbuf (br-buffer reader))
-        (size (length buffer)))
+        (size (length buffer))
+        ;; Hoisted from the inner loop: checking POS against this once per
+        ;; symbol is a single tagged-fixnum compare, whereas
+        ;; (+ POS HEADROOM) against LIMIT costs two tag conversions.
+        (safe-limit (- limit +inflate-headroom+)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend size))
+             (type fixnum nbits rpos rend size safe-limit))
     (with-pinned-input (rsap rbuf)
       #+sbcl
       (sb-sys:with-pinned-objects (buffer)
@@ -723,16 +719,14 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
           (declare (type sb-sys:system-area-pointer osap))
           (%with-inflate-tables (lit dist)
             (block decode-done
-              (%inflate-bounded-unchecked-loop
-               (<= (+ pos +inflate-headroom+) limit) decode-done)
+              (%inflate-bounded-unchecked-loop (<= pos safe-limit) decode-done)
               (%inflate-bounded-loop nil decode-done)))))
       #-sbcl
       (let ((osap nil))
         (declare (type null osap))
         (%with-inflate-tables (lit dist)
           (block decode-done
-            (%inflate-bounded-unchecked-loop
-             (<= (+ pos +inflate-headroom+) limit) decode-done)
+            (%inflate-bounded-unchecked-loop (<= pos safe-limit) decode-done)
             (%inflate-bounded-loop nil decode-done)))))))
 
 (defun %inflate-token-stream (reader buffer size pos lit dist limit)

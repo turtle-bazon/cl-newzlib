@@ -298,7 +298,7 @@ fast path (no symbol store/load roundtrip through memory)."
   `(progn
      (%inflate-fill ,root)
      (let ((entry (aref ,fast (logand accum ,mask))))
-       (declare (type fixnum entry))
+       (declare (type (unsigned-byte 16) entry))
        (if (zerop entry)
            (%inflate-decode-slow ,table ,root ,mask)
            (let ((clen (ash entry -9)))
@@ -317,7 +317,7 @@ needs no second refill; the truncated-tail check replaces it."
   `(progn
      (%inflate-fill 15)
      (let ((entry (aref ,fast (logand accum ,mask))))
-       (declare (type fixnum entry))
+       (declare (type (unsigned-byte 16) entry))
        (if (zerop entry)
            (%inflate-decode-slow ,table ,root ,mask)
            (let ((clen (ash entry -9)))
@@ -664,7 +664,7 @@ handles only long codes (table entry 0), low bit counts and end-of-block."
      (unless ,while (return))
      (loop while (and (>= nbits 15) ,while) do
        (let ((entry (aref lfast (logand accum lmask))))
-         (declare (type fixnum entry))
+         (declare (type (unsigned-byte 16) entry))
          (when (zerop entry) (return))
          (let ((s (logand entry #x1FF)))
            (declare (type (unsigned-byte 9) s))
@@ -706,7 +706,7 @@ checked against it with one tagged-fixnum compare."
                safe-size (- nsize +inflate-headroom+))))
      (loop while (and (>= nbits 15) (<= pos safe-size)) do
        (let ((entry (aref lfast (logand accum lmask))))
-         (declare (type fixnum entry))
+         (declare (type (unsigned-byte 16) entry))
          (when (zerop entry) (return))
          (let ((s (logand entry #x1FF)))
            (declare (type (unsigned-byte 9) s))

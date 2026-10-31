@@ -23,7 +23,7 @@
 ;;;   sb-simd: the x86-64 gate matters because the VOP emitters and sb-simd's
 ;;;   CPUID helper exist only there.)
 
-#+(and sbcl x86-64 cl-newzlib-le newzlib-simd)
+#+(and sbcl x86-64 cl-newzlib-le newzlib-pclmul)
 (progn
   ;;; ------------------------------------------------------------------
   ;;; PCLMULQDQ VOPs, one per imm8 used (monomorphic keeps each generator

@@ -100,3 +100,40 @@
              (limit (min (- 512 (max a b)) (+ 1 (mod i 31)))))
         (is (= (cl-newzlib::leading-equal-octets/scalar data a b limit)
                (funcall fn data a b limit)))))))
+
+#+(and sbcl newzlib-avx2)
+(test simd-adler-reselects-at-runtime
+  ;; Simulate an image compiled on AVX2 being restarted on a CPU without it:
+  ;; the startup hook must clear the implementation, and restore it when the
+  ;; capability check succeeds again.
+  (let ((predicate #'cl-newzlib::simd-adler-cpu-available-p)
+        (impl cl-newzlib::*simd-adler-impl*))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'cl-newzlib::simd-adler-cpu-available-p)
+                 (lambda () nil))
+           (cl-newzlib::update-simd-adler-impl)
+           (is (null cl-newzlib::*simd-adler-impl*))
+           (setf (symbol-function 'cl-newzlib::simd-adler-cpu-available-p)
+                 predicate)
+           (cl-newzlib::update-simd-adler-impl)
+           (is (functionp cl-newzlib::*simd-adler-impl*)))
+      (setf (symbol-function 'cl-newzlib::simd-adler-cpu-available-p) predicate
+            cl-newzlib::*simd-adler-impl* impl))))
+
+#+(and sbcl newzlib-pclmul)
+(test pclmul-crc-reselects-at-runtime
+  (let ((predicate #'cl-newzlib::pclmul-cpu-available-p)
+        (impl cl-newzlib::*pclmul-crc-impl*))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'cl-newzlib::pclmul-cpu-available-p)
+                 (lambda () nil))
+           (cl-newzlib::update-pclmul-crc-impl)
+           (is (null cl-newzlib::*pclmul-crc-impl*))
+           (setf (symbol-function 'cl-newzlib::pclmul-cpu-available-p)
+                 predicate)
+           (cl-newzlib::update-pclmul-crc-impl)
+           (is (functionp cl-newzlib::*pclmul-crc-impl*)))
+      (setf (symbol-function 'cl-newzlib::pclmul-cpu-available-p) predicate
+            cl-newzlib::*pclmul-crc-impl* impl))))

@@ -34,6 +34,7 @@
 
 #+newzlib-simd
 (progn
+  #+newzlib-avx2
   (defun %leading-equal-octets/avx2 (input a b limit)
     (declare (optimize (speed 3) (safety 0))
              (type (simple-array (unsigned-byte 8) (*)) input)
@@ -110,6 +111,7 @@
              (type fixnum a b limit))
     (the fixnum
       (sb-simd-internals:instruction-set-case
+        #+newzlib-avx2
         (:avx2 (%leading-equal-octets/avx2 input a b limit))
         (:sse4.1 (%leading-equal-octets/sse2 input a b limit))
         (:x86-64 (leading-equal-octets/scalar input a b limit))))))
@@ -119,6 +121,7 @@
   "Return the best implementation available on the current CPU.  Called once
 per compression, so image migration/restart picks up the new CPU features."
   (sb-simd-internals:instruction-set-case
+    #+newzlib-avx2
     (:avx2 #'%leading-equal-octets/avx2)
     (:sse4.1 #'%leading-equal-octets/sse2)
     (:x86-64 #'leading-equal-octets/scalar)))

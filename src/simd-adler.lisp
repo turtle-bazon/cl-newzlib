@@ -13,7 +13,7 @@
 ;;; engine); anything else leaves *simd-adler-impl* NIL and the library
 ;;; silently keeps the scalar loop.  Other Lisps load this file inertly.
 
-#+(and sbcl x86-64 newzlib-simd)
+#+(and sbcl x86-64 newzlib-avx2)
 (progn
   (defvar *adler-w32* nil)   ; s8 weights [32..1], one 32-byte vector
   (defvar *adler-ones* nil)  ; s16 ones

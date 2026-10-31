@@ -337,7 +337,8 @@ Lengths 3..16 are unrolled: they are the overwhelming majority of matches
 in text and binary, and the loop overhead dominates their cost."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src length))
+           (type fixnum pos src)
+           (type (unsigned-byte 9) length))
   (case length
     (3 (setf (aref buffer pos) (aref buffer src)
              (aref buffer (+ pos 1)) (aref buffer (+ src 1))
@@ -389,7 +390,8 @@ in text and binary, and the loop overhead dominates their cost."
   "Copy a distance-1 run.  Returns the new POS."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos length))
+           (type fixnum pos)
+           (type (unsigned-byte 9) length))
   (let ((b (aref buffer (1- pos))))
     (fill buffer b :start pos :end (+ pos length)))
   (+ pos length))
@@ -398,7 +400,8 @@ in text and binary, and the loop overhead dominates their cost."
   "Copy a non-overlapping match.  Returns the new POS."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src length))
+           (type fixnum pos src)
+           (type (unsigned-byte 9) length))
   (replace buffer buffer :start1 pos :start2 src
            :end1 (+ pos length) :end2 (+ src length))
   (+ pos length))
@@ -409,7 +412,9 @@ Every REPLACE reads a region ending before its destination begins, so
 plain forward copying is safe, turning O(LENGTH) into O(LOG) copies."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src distance length))
+           (type fixnum pos src)
+           (type (unsigned-byte 16) distance)
+           (type (unsigned-byte 9) length))
   (let ((done distance))
     (declare (type fixnum done))
     (replace buffer buffer :start1 pos :start2 src
@@ -429,7 +434,9 @@ stores (writing a little past LENGTH is harmless: those positions are not
 live yet and will be overwritten)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src distance length)
+           (type fixnum pos src)
+           (type (unsigned-byte 16) distance)
+           (type (unsigned-byte 9) length)
            #+sbcl (type (or null sb-sys:system-area-pointer) osap)
            #-sbcl (ignore osap)
            (type (or null fixnum) limit)
@@ -492,7 +499,9 @@ Used by the unchecked/growable loops, which guarantee room for any match
 (and for the up-to-64-byte wide store) before dispatching."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src distance length)
+           (type fixnum pos src)
+           (type (unsigned-byte 16) distance)
+           (type (unsigned-byte 9) length)
            #+sbcl (type (or null sb-sys:system-area-pointer) osap)
            #-sbcl (ignore osap)
            #-(and sbcl cl-newzlib-le) (ignore osap))

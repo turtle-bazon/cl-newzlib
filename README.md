@@ -19,8 +19,10 @@ inflater builds canonical decode tables with a Kraft-inequality check.
 
 * [iterate](https://github.com/Shinmera/iterate)
 * [metabang-bind](https://github.com/gwkkwg/metabang-bind)
+* [sb-cpu-features](https://developer.bazon.ru/common-lisp/sb-cpu-features) — SBCL only
 
-Both are available through Quicklisp.
+All are available through Quicklisp.  On SBCL, `sb-cpu-features` supplies
+CPUID/XGETBV-based feature detection and image-restart re-probing.
 
 ## One-shot API
 
@@ -130,11 +132,11 @@ cl-newzlib's matcher; zlib is always run with its default strategy.
 
 AVX2, SSE4.1 and PCLMULQDQ code is compiled whenever the sb-simd packages
 are available, including on a build machine without those CPU features.
-Every entry point is selected at runtime: an image built on a non-AVX2
-machine can use its AVX2 code when moved to an AVX2 host, and an image
-built on AVX2 disables those paths when restarted on a lesser CPU.  The
-AVX2 check includes OS YMM state (SBCL's XGETBV-backed flag), not just
-CPUID.
+Detection goes through `sb-cpu-features` on SBCL.  Every entry point is
+selected at runtime: an image built on a non-AVX2 machine can use its AVX2
+code when moved to an AVX2 host, and an image built on AVX2 disables those
+paths when restarted on a lesser CPU.  The AVX2 check includes OS YMM state
+(SBCL's XGETBV-backed flag), not just CPUID.
 
 Compile-time constant folding is the one trap: SBCL may evaluate AVX2
 operations during compilation if their arguments are constant.  On an
@@ -152,4 +154,5 @@ around 0.9-1.0x.  Binary inflate is the remaining small gap.
 
 ## Status
 
-The full suite passes on SBCL 2.6.7 and 2.6.9 (1567 checks with AVX2 compiled, 1563 without).
+The full suite passes on SBCL 2.6.7 and 2.6.9 (1572 checks with AVX2 compiled;
+the non-AVX2 build configuration is also tested).

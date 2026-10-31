@@ -166,6 +166,6 @@ side avoids).  Run-to-run variation on a shared host is about ±0.05x.
 
 ## Status
 
-The full suite passes on SBCL 2.6.9 (1574 checks with AVX2 compiled; the
+The full suite passes on SBCL 2.6.9 (1576 checks with AVX2 compiled; the
 non-AVX2 build configuration is also tested).  It also passes on ECL 21.2.1
-and CCL 1.13 (1495 checks; SBCL-only paths are skipped).
+and CCL 1.13 (1497 checks; SBCL-only paths are skipped).

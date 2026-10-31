@@ -19,6 +19,14 @@
   (when (find-package :sb-simd-sse2)
     (pushnew :newzlib-pclmul *features*)))
 
+(defun avx2-usable-p ()
+  "True only when the CPU implements AVX2 *and* the OS has enabled the
+YMM state.  SBCL's runtime sets AVX2_SUPPORTED after CPUID plus XGETBV, so
+this covers the VM/old-kernel case that a bare CPUID check misses."
+  #+sbcl (ignore-errors
+           (plusp (sb-alien:extern-alien "avx2_supported" sb-alien:int)))
+  #-sbcl nil)
+
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))
 

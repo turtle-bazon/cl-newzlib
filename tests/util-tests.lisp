@@ -142,3 +142,19 @@
              (is (functionp cl-newzlib::*pclmul-crc-impl*))))
       (setf (symbol-function 'cl-newzlib::pclmul-cpu-available-p) predicate
             cl-newzlib::*pclmul-crc-impl* impl))))
+
+#+(and sbcl newzlib-avx2)
+(test avx2-os-state-gate
+  ;; CPUID can advertise AVX2 while the OS has not enabled YMM state.
+  ;; The runtime selector must then avoid the AVX2 implementation.
+  (let ((orig (symbol-function 'cl-newzlib::avx2-usable-p)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'cl-newzlib::avx2-usable-p)
+                 (lambda () nil))
+           (is (not (eq (cl-newzlib::select-leading-equal-octets)
+                        #'cl-newzlib::%leading-equal-octets/avx2)))
+           (cl-newzlib::update-simd-adler-impl)
+           (is (null cl-newzlib::*simd-adler-impl*)))
+      (setf (symbol-function 'cl-newzlib::avx2-usable-p) orig)
+      (cl-newzlib::update-simd-adler-impl))))

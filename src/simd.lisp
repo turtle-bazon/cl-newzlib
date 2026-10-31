@@ -104,27 +104,25 @@
             do (incf n))
       n))
 
+  (defun select-leading-equal-octets ()
+    "Return the best implementation usable on the current CPU.  AVX2 is
+gated on both CPUID and OS XMM/YMM state (AVX2-USABLE-P); SSE4.1 is gated
+by sb-simd's dispatch.  Called once per compression, so image migration and
+restart re-evaluate the current machine."
+    #+newzlib-avx2
+    (when (avx2-usable-p)
+      (return-from select-leading-equal-octets #'%leading-equal-octets/avx2))
+    (sb-simd-internals:instruction-set-case
+      (:sse4.1 #'%leading-equal-octets/sse2)
+      (:x86-64 #'leading-equal-octets/scalar)))
+
   (declaim (inline leading-equal-octets))
   (defun leading-equal-octets (input a b limit)
     (declare (optimize (speed 3) (safety 0))
              (type (simple-array (unsigned-byte 8) (*)) input)
              (type fixnum a b limit))
     (the fixnum
-      (sb-simd-internals:instruction-set-case
-        #+newzlib-avx2
-        (:avx2 (%leading-equal-octets/avx2 input a b limit))
-        (:sse4.1 (%leading-equal-octets/sse2 input a b limit))
-        (:x86-64 (leading-equal-octets/scalar input a b limit))))))
-
-#+newzlib-simd
-(defun select-leading-equal-octets ()
-  "Return the best implementation available on the current CPU.  Called once
-per compression, so image migration/restart picks up the new CPU features."
-  (sb-simd-internals:instruction-set-case
-    #+newzlib-avx2
-    (:avx2 #'%leading-equal-octets/avx2)
-    (:sse4.1 #'%leading-equal-octets/sse2)
-    (:x86-64 #'leading-equal-octets/scalar)))
+      (funcall (select-leading-equal-octets) input a b limit))))
 
 #-newzlib-simd
 (defun select-leading-equal-octets ()

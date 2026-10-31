@@ -106,12 +106,8 @@ the <32-byte remainder to the scalar engine with the unfolded sums."
   ;;; Availability probe + load-time self-test.
   ;;; ------------------------------------------------------------------
   (defun simd-adler-cpu-available-p ()
-    "True when CPUID reports AVX2 (leaf 7, EBX bit 5), queried from inside
-the implementation -- no OS channel involved."
-    (handler-case
-        (and (>= (sb-simd-internals::cpuid 0) 7)
-             (logbitp 5 (nth-value 1 (sb-simd-internals::cpuid 7))))
-      (error () nil)))
+    "True when AVX2 is implemented and enabled by the OS."
+    (avx2-usable-p))
 
   (defun simd-adler-self-test-p ()
     "Randomized differential check of the vector path against the scalar

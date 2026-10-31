@@ -87,3 +87,16 @@
          (part1 (cl-newzlib:crc32 data 0 64))
          (part2 (cl-newzlib:crc32 data 64 128 part1)))
     (is (= whole part2))))
+
+#+newzlib-simd
+(test simd-leading-equal-dispatch
+  ;; The selected implementation must agree with the scalar oracle; this also
+  ;; exercises the runtime instruction-set dispatch used for image migration.
+  (let ((data (random-octets 512))
+        (fn (cl-newzlib::select-leading-equal-octets)))
+    (dotimes (i 64)
+      (let* ((a (mod (* i 37) 480))
+             (b (mod (* i 53) 480))
+             (limit (min (- 512 (max a b)) (+ 1 (mod i 31)))))
+        (is (= (cl-newzlib::leading-equal-octets/scalar data a b limit)
+               (funcall fn data a b limit)))))))

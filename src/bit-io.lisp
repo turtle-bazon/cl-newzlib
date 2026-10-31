@@ -93,10 +93,55 @@ the system-area pointer BASE."
             (declare (ignore ,sap-var))
             ,@body))
 
+(declaim (inline flush-complete-words))
+(defun flush-complete-words (writer)
+  "Flush complete 32-bit words, leaving any partial tail in the accumulator.
+This lets WRITE-BITS batch several small codes before touching memory."
+  (declare (optimize (speed 3) (safety 0)))
+  (let ((accum (bw-accum writer))
+        (nbits (bw-nbits writer))
+        (pos (bw-pos writer))
+        (buffer (bw-buffer writer))
+        (size (bw-size writer)))
+    (declare (type (unsigned-byte 64) accum)
+             (type fixnum nbits pos size)
+             (type (simple-array (unsigned-byte 8) (*)) buffer))
+    #+(and sbcl cl-newzlib-le)
+    (loop while (>= nbits 32) do
+      (when (> (+ pos 4) size)
+        (let ((bigger (make-octet-buffer (* 2 size))))
+          (replace bigger buffer :end2 size)
+          (setq buffer bigger size (* 2 size))))
+      (setf (sb-sys:sap-ref-32 (sb-sys:vector-sap buffer) pos)
+            (ldb (byte 32 0) accum))
+      (setf accum (ash accum -32)
+            nbits (- nbits 32)
+            pos (+ pos 4)))
+    #-(and sbcl cl-newzlib-le)
+    (loop while (>= nbits 32) do
+      (when (> (+ pos 4) size)
+        (let ((bigger (make-octet-buffer (* 2 size))))
+          (replace bigger buffer :end2 size)
+          (setq buffer bigger size (* 2 size))))
+      (setf (aref buffer pos) (logand accum #xFF)
+            (aref buffer (+ pos 1)) (logand (ash accum -8) #xFF)
+            (aref buffer (+ pos 2)) (logand (ash accum -16) #xFF)
+            (aref buffer (+ pos 3)) (logand (ash accum -24) #xFF))
+      (setf accum (ash accum -32)
+            nbits (- nbits 32)
+            pos (+ pos 4)))
+    (setf (bw-accum writer) accum
+          (bw-nbits writer) nbits
+          (bw-pos writer) pos
+          (bw-buffer writer) buffer
+          (bw-size writer) size))
+  nil)
+
 (declaim (inline flush-pending-bytes))
 (defun flush-pending-bytes (writer)
   "Flush as many whole bytes as possible from the accumulator into the buffer."
   (declare (optimize (speed 3) (safety 0)))
+  (flush-complete-words writer)
   (let ((accum (bw-accum writer))
         (nbits (bw-nbits writer))
         (pos (bw-pos writer))
@@ -145,7 +190,7 @@ needed."
            (type (unsigned-byte 64) bits)
            (type (integer 0 16) count))
   (let ((nbits (bw-nbits writer)))
-    (declare (type (unsigned-byte 4) nbits))
+    (declare (type (unsigned-byte 5) nbits))
     (setf (bw-accum writer)
           (definitely-the
               (unsigned-byte 64)
@@ -154,17 +199,18 @@ needed."
                            (ldb (byte count 0) bits))
                          nbits)))
           (bw-nbits writer) (+ nbits count))
-    (when (>= (+ nbits count) 8)
-      (flush-pending-bytes writer)))
+    (when (>= (+ nbits count) 32)
+      (flush-complete-words writer)))
   nil)
 
 (declaim (inline flush-bits))
 (defun flush-bits (writer)
   "Zero-pad the accumulator to a byte boundary and flush it."
   (declare (optimize (speed 3) (safety 0)))
-  (when (plusp (bw-nbits writer))
-    (setf (bw-nbits writer) 8)
-    (flush-pending-bytes writer))
+  (let ((nbits (bw-nbits writer)))
+    (when (plusp nbits)
+      (setf (bw-nbits writer) (* 8 (ceiling nbits 8)))
+      (flush-pending-bytes writer)))
   nil)
 
 (declaim (inline writer-bytes))

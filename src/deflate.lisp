@@ -33,7 +33,7 @@
 ;;; used for levels >= 4 (deflate_slow); levels 1-3 are greedy (deflate_fast).
 (defun good-length (level &optional (size 0))
   (declare (type fixnum level size))
-  (if (and (> size +large-deflate-input+) (or (= level 6) (= level 7)))
+  (if (and (> size +large-deflate-input+) (or (= level 6) (= level 7) (= level 9)))
       3
       (case level
         (0 0)
@@ -90,12 +90,16 @@
                 (9 1536)
                 (otherwise (error 'newzlib-parameter-error
                                   :detail (format nil "invalid compression level ~A" level))))))
+    ;; Large inputs trade a little ratio for throughput: the high-level
+    ;; chain budgets are reduced more aggressively than zlib's table, and
+    ;; levels 3/6/9 use shorter chains (level 9 also halves NICE/LAZY below).
     (if (> size +large-deflate-input+)
         (case level
+          (3 24)
           (6 24)
           (7 48)
           (8 192)
-          (9 768)
+          (9 80)
           (otherwise base))
         base)))
 
@@ -176,7 +180,7 @@ like zlib's INSERT_STRING match_head)."
                           (values fixnum fixnum fixnum))
                  %lm-limits)
          (ftype (function ((simple-array (unsigned-byte 8) (*))
-                           fixnum fixnum fixnum)
+                           fixnum fixnum fixnum function)
                           fixnum)
                  %lm-extend))
 
@@ -226,17 +230,18 @@ usually never execute.  ISAP is the pinned input SAP (SBCL only)."
        (= p0 (aref input cand))
        (= p1 (aref input (1+ cand)))))
 
-(defun %lm-extend (input pos cand limit)
+(defun %lm-extend (input pos cand limit eq-fn)
   "Full extension length from offset 2 via bulk compare (SIMD-backed; a
 scalar-first probe was tried and netted negative, so kept SIMD)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
-           (type fixnum pos cand limit))
+           (type fixnum pos cand limit)
+           (type function eq-fn))
   (if (< 2 limit)
-      (+ 2 (leading-equal-octets input (+ pos 2) (+ cand 2) (- limit 2)))
+      (+ 2 (funcall eq-fn input (+ pos 2) (+ cand 2) (- limit 2)))
       2))
 
-(defmacro longest-match (input pos end first-res head prev max-chain nice good best-len isap)
+(defmacro longest-match (input pos end first-res head prev max-chain nice good best-len isap eq-fn)
   "Longest match for INPUT[POS] over BEST-LEN (clamped >= 1 for the
 best-len-1 lookahead).  FIRST-RES is the pre-insert chain head
 (or #xFFFFFFFF; HEAD never evaluated); ISAP is the pinned input SAP
@@ -246,10 +251,12 @@ DISTANCE), inlining at both search sites; args side-effect-free."
         (g-res (gensym "RES")) (g-prev (gensym "PREV")) (g-max (gensym "MAX"))
         (g-nice (gensym "NICE")) (g-good (gensym "GOOD")) (g-best (gensym "BEST"))
         (g-dist (gensym "DIST")) (g-chain (gensym "CHAIN")) (g-isap (gensym "ISAP"))
-        (g-p0 (gensym "P0")) (g-p1 (gensym "P1")) (g-cand (gensym "CAND")) (g-len (gensym "LEN")))
+        (g-p0 (gensym "P0")) (g-p1 (gensym "P1")) (g-cand (gensym "CAND")) (g-len (gensym "LEN"))
+        (g-eq (gensym "EQ")))
     `(let ((,g-input ,input) (,g-pos ,pos) (,g-end ,end) (,g-res ,first-res)
            (,g-prev ,prev) (,g-max ,max-chain) (,g-nice ,nice) (,g-good ,good)
-           (,g-best (max ,best-len 1)) (,g-dist 0) (,g-chain 0) (,g-isap ,isap))
+           (,g-best (max ,best-len 1)) (,g-dist 0) (,g-chain 0) (,g-isap ,isap)
+           (,g-eq ,eq-fn))
        (declare (optimize (speed 3) (safety 0))
                 (type (simple-array (unsigned-byte 8) (*)) ,g-input)
                 (type (simple-array (unsigned-byte 32) (*)) ,g-prev)
@@ -269,7 +276,7 @@ DISTANCE), inlining at both search sites; args side-effect-free."
                (declare (type fixnum ,g-cand))
                (when (%lm-candidate-ok-p ,g-input ,g-pos ,g-end ,g-cand
                                          ,g-best ,g-p0 ,g-p1 ,g-isap)
-                 (let ((,g-len (%lm-extend ,g-input ,g-pos ,g-cand limit)))
+                 (let ((,g-len (%lm-extend ,g-input ,g-pos ,g-cand limit ,g-eq)))
                    (declare (type fixnum ,g-len))
                    (when (> ,g-len ,g-best)
                      (setf ,g-best ,g-len ,g-dist (- ,g-pos ,g-cand))
@@ -501,7 +508,7 @@ compression is fully deterministic across calls."
                (longest-match input pos end cand head prev
                               max-chain nice good
                               (if have-pending pending-len (1- +min-match+))
-                              isap)
+                              isap eq-fn)
              (setf mlen len mdist d)))
          (cond ((and have-pending
                      (>= pending-len +min-match+)
@@ -526,7 +533,7 @@ compression is fully deterministic across calls."
                   (%advance-hash-state)))))))
 
 (defun %lz77-search-lazy (input start end nice good max-chain max-lazy
-                           tokens token-capacity head prev lit-freq dist-freq)
+                           tokens token-capacity head prev lit-freq dist-freq eq-fn)
   "Lazy matching (zlib deflate_slow): defer each match one position and
 adopt it only if no longer match starts on the next byte."
   (declare (optimize (speed 3) (safety 0))
@@ -534,7 +541,8 @@ adopt it only if no longer match starts on the next byte."
            (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end nice good max-chain max-lazy token-capacity))
+           (type fixnum start end nice good max-chain max-lazy token-capacity)
+           (type function eq-fn))
   (let ((nsym 0) (extra-bits 0) (pos start)
         (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0)
         (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
@@ -552,14 +560,15 @@ adopt it only if no longer match starts on the next byte."
     (values nsym extra-bits tokens token-capacity)))
 
 (defun %lz77-search-greedy (input start end nice good max-chain max-lazy
-                             tokens token-capacity head prev lit-freq dist-freq)
+                             tokens token-capacity head prev lit-freq dist-freq eq-fn)
   "Greedy matching (zlib deflate_fast) for levels 1-3."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array (unsigned-byte 32) (*)) tokens)
            (type (simple-array (unsigned-byte 32) (*)) head prev)
            (type (simple-array fixnum (*)) lit-freq dist-freq)
-           (type fixnum start end nice good max-chain max-lazy token-capacity))
+           (type fixnum start end nice good max-chain max-lazy token-capacity)
+           (type function eq-fn))
   (let ((nsym 0) (extra-bits 0) (pos start)
         (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
     (declare (type fixnum nsym extra-bits pos hash-pos hash-value
@@ -583,7 +592,7 @@ adopt it only if no longer match starts on the next byte."
                     (multiple-value-bind (len d)
                         (longest-match input pos end cand head prev
                                        max-chain nice good (1- +min-match+)
-                                       isap)
+                                       isap eq-fn)
                       (if (>= len +min-match+)
                           (progn
                             (%emit-match len d)
@@ -598,7 +607,7 @@ adopt it only if no longer match starts on the next byte."
      (values nsym extra-bits tokens token-capacity))))
 
 (defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
-                     tokens token-capacity head prev lit-freq dist-freq)
+                     tokens token-capacity head prev lit-freq dist-freq eq-fn)
   "LZ77 tokenization core; see RUN-LZ77.  Returns four values including the
 possibly-grown token vector and its capacity."
   (declare (optimize (speed 3) (safety 0))
@@ -609,9 +618,9 @@ possibly-grown token vector and its capacity."
            (type fixnum start end nice good max-chain max-lazy token-capacity))
   (if lazy-p
       (%lz77-search-lazy input start end nice good max-chain max-lazy
-                         tokens token-capacity head prev lit-freq dist-freq)
+                         tokens token-capacity head prev lit-freq dist-freq eq-fn)
       (%lz77-search-greedy input start end nice good max-chain max-lazy
-                           tokens token-capacity head prev lit-freq dist-freq)))
+                           tokens token-capacity head prev lit-freq dist-freq eq-fn)))
 
 (defun run-lz77 (input start end level tokens token-capacity
                  lit-freq dist-freq
@@ -631,21 +640,27 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end level token-capacity))
   (check-compression-mode mode)
-  (let ((fast-p (eq mode :fast)))
+  (let* ((fast-p (eq mode :fast))
+         (large (> (- end start) +large-deflate-input+))
+         ;; Level 9's default 258/258 lookahead is costly in Lisp.  On large
+         ;; inputs, 64/32 keeps the level-9 ratio close to zlib while roughly
+         ;; doubling throughput; small inputs keep the full-quality settings.
+         (nice (if (and large (= level 9)) 64 (nice-length level)))
+         (lazy (if (and large (= level 9)) 32 (lazy-length level)))
+         (eq-fn (select-leading-equal-octets)))
     (multiple-value-bind (nsym extra-bits tokens token-capacity)
         (%lz77-search input start end
-                      (if fast-p
-                          (min 32 (nice-length level))
-                          (nice-length level))
+                      (if fast-p (min 32 nice) nice)
                       (if fast-p
                           (min 3 (good-length level (- end start)))
                           (good-length level (- end start)))
                       (if fast-p
                           (min 24 (chain-limit level (- end start)))
                           (chain-limit level (- end start)))
-                      (lazy-length level)
+                      lazy
                       (and (not fast-p) (> level 3))
-                      tokens token-capacity head prev lit-freq dist-freq)
+                      tokens token-capacity head prev lit-freq dist-freq
+                      eq-fn)
       (multiple-value-bind (final-nsym tokens token-capacity)
           (finish-token-stream tokens token-capacity lit-freq nsym)
         (values final-nsym extra-bits tokens token-capacity)))))
@@ -666,11 +681,13 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
 
 (declaim (inline align-writer))
 (defun align-writer (writer)
-  "Pad WRITER with zero bits up to the next byte boundary."
+  "Pad WRITER with zero bits up to the next byte boundary and commit all
+pending bytes, so callers may write directly at BW-POS."
   (declare (optimize (speed 3) (safety 0)))
   (let ((pad (logand 7 (bw-nbits writer))))
     (when (plusp pad)
-      (write-bits writer 0 (- 8 pad)))))
+      (write-bits writer 0 (- 8 pad))))
+  (flush-pending-bytes writer))
 
 (defun stored-block-bits (writer n)
   "Bit count of stored blocks covering N bytes given WRITER's current

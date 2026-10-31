@@ -96,6 +96,49 @@ in both directions, checksum comparison, window/boundary behaviour).
 tests additionally need a loadable `libz.so.1`; each one is skipped when
 `zlib-available-p` is false, so the rest of the suite still runs.
 
+## Benchmarks
+
+`bench/run.sh` compares cl-newzlib against the system C zlib on identical
+input.  It measures both the one-shot API and the allocation-free `into`
+API, reports MiB/s of uncompressed data plus compressed size, and
+cross-checks every stream (cl-newzlib output is inflated by zlib and vice
+versa) before timing it.
+
+```sh
+bench/run.sh                 # 2 MiB datasets, levels 1/3/6/9, 3 samples
+bench/run.sh --quick         # 1 MiB, levels 1/6, 1 sample
+bench/run.sh --size 8MiB --levels 1,6,9 --samples 5
+bench/run.sh --datasets text,binary   # realistic workloads only
+bench/run.sh --format gzip   # or raw
+bench/run.sh --mode fast     # cl-newzlib's greedy matcher
+bench/run.sh --help
+
+# e.g. compare a second SBCL built through Roswell
+BENCH_LISP="$HOME/.roswell/impls/x86-64/linux/sbcl-bin/2.6.9/bin/sbcl" \
+  bench/run.sh
+```
+
+The default datasets are real text (`/usr/share/doc/rclone/MANUAL.html`),
+a real binary (`/usr/local/bin/sbcl`), zeroes, and deterministic random
+bytes.  Missing system files fall back to the repository source or
+`/usr/bin/bash`, so the harness also runs on other machines.  The source
+tree can be benchmarked with `--datasets source`.
+
+Reported `cl/zlib` values are cl-newzlib's throughput divided by zlib's,
+so values above 1 mean cl-newzlib is faster.  `--mode fast` changes only
+cl-newzlib's matcher; zlib is always run with its default strategy.
+
+SIMD code paths (AVX2, SSE4.1, PCLMULQDQ) are selected at runtime.  If an
+image is built on a machine with AVX2 and restarted on one without it, the
+startup hooks re-select the scalar/SSE paths instead of executing the
+unavailable instructions.
+
+On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
+text/binary inputs), compression is now about 1.1-1.5x zlib at levels
+3/6/9 (level 9 reaches several times zlib on binary data).  Decompression
+is close to parity on text (~0.9x) and still around 0.8x on binary, so
+inflate remains the next target.
+
 ## Status
 
-The full suite passes: 1497 checks, 0 failures.
+The full suite passes: 1561 checks, 0 failures on SBCL 2.6.7 and 2.6.9.

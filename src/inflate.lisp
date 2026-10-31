@@ -252,11 +252,11 @@ growth steps; steady state reuses high-water buffers anyway.")
 
 (defmacro %inflate-take (n)
   "Consume N bits (caller guarantees NBITS >= N); returns a fixnum."
-  `(prog1 (definitely-the fixnum (logand accum (aref +low-bit-masks+ ,n)))
+  `(prog1 (definitely-the fixnum (logand accum (aref masks ,n)))
      (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
            nbits (- nbits ,n))))
 
-(defmacro %inflate-decode-slow (table root)
+(defmacro %inflate-decode-slow (table root mask)
   "Canonical bit walk for codes longer than ROOT; yields the symbol value.
 Cold path: tables load from TABLE itself, keeping them out of the hot
 loop's register working set."
@@ -264,7 +264,7 @@ loop's register working set."
          (first (hdt-first ,table))
          (syms (hdt-symbols ,table))
          (index (hdt-index-root ,table))
-         (code (reverse-bits (logand accum (aref +low-bit-masks+ ,root)) ,root))
+         (code (reverse-bits (logand accum ,mask) ,root))
          (len ,root))
      (declare (type fixnum code index len)
                (type (simple-array (unsigned-byte 16) (*))
@@ -286,15 +286,15 @@ loop's register working set."
            (return (aref syms (+ index (- code (aref first len))))))
          (setf index (+ index count))))))
 
-(defmacro %inflate-decode-one (table root fast)
+(defmacro %inflate-decode-one (table root fast mask)
   "Decode one symbol from TABLE; yields its value, register-kept on the
 fast path (no symbol store/load roundtrip through memory)."
   `(progn
      (%inflate-fill ,root)
-     (let ((entry (aref ,fast (logand accum (aref +low-bit-masks+ ,root)))))
+     (let ((entry (aref ,fast (logand accum ,mask))))
        (declare (type fixnum entry))
        (if (zerop entry)
-           (%inflate-decode-slow ,table ,root)
+           (%inflate-decode-slow ,table ,root ,mask)
            (let ((clen (ash entry -9)))
              (declare (type fixnum clen))
              ;; Consume only after enough bits are known present: with a
@@ -309,12 +309,57 @@ fast path (no symbol store/load roundtrip through memory)."
                  %copy-overlap-match %copy-inflate-match))
 
 (defun %copy-tiny-match (buffer pos src length)
-  "Copy a short (<= 8 byte) match; overlap-safe.  Returns the new POS."
+  "Copy a short (<= 16 byte) match; overlap-safe.  Returns the new POS.
+Lengths 3..16 are unrolled: they are the overwhelming majority of matches
+in text and binary, and the loop overhead dominates their cost."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
            (type fixnum pos src length))
-  (loop for k fixnum below length do
-    (setf (aref buffer (+ pos k)) (aref buffer (+ src k))))
+  (case length
+    (3 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))))
+    (4 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))
+             (aref buffer (+ pos 3)) (aref buffer (+ src 3))))
+    (5 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))
+             (aref buffer (+ pos 3)) (aref buffer (+ src 3))
+             (aref buffer (+ pos 4)) (aref buffer (+ src 4))))
+    (6 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))
+             (aref buffer (+ pos 3)) (aref buffer (+ src 3))
+             (aref buffer (+ pos 4)) (aref buffer (+ src 4))
+             (aref buffer (+ pos 5)) (aref buffer (+ src 5))))
+    (7 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))
+             (aref buffer (+ pos 3)) (aref buffer (+ src 3))
+             (aref buffer (+ pos 4)) (aref buffer (+ src 4))
+             (aref buffer (+ pos 5)) (aref buffer (+ src 5))
+             (aref buffer (+ pos 6)) (aref buffer (+ src 6))))
+    (8 (setf (aref buffer pos) (aref buffer src)
+             (aref buffer (+ pos 1)) (aref buffer (+ src 1))
+             (aref buffer (+ pos 2)) (aref buffer (+ src 2))
+             (aref buffer (+ pos 3)) (aref buffer (+ src 3))
+             (aref buffer (+ pos 4)) (aref buffer (+ src 4))
+             (aref buffer (+ pos 5)) (aref buffer (+ src 5))
+             (aref buffer (+ pos 6)) (aref buffer (+ src 6))
+             (aref buffer (+ pos 7)) (aref buffer (+ src 7))))
+    (9 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8))))
+    (10 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9))))
+    (11 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10))))
+    (12 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10)) (aref buffer (+ pos 11)) (aref buffer (+ src 11))))
+    (13 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10)) (aref buffer (+ pos 11)) (aref buffer (+ src 11)) (aref buffer (+ pos 12)) (aref buffer (+ src 12))))
+    (14 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10)) (aref buffer (+ pos 11)) (aref buffer (+ src 11)) (aref buffer (+ pos 12)) (aref buffer (+ src 12)) (aref buffer (+ pos 13)) (aref buffer (+ src 13))))
+    (15 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10)) (aref buffer (+ pos 11)) (aref buffer (+ src 11)) (aref buffer (+ pos 12)) (aref buffer (+ src 12)) (aref buffer (+ pos 13)) (aref buffer (+ src 13)) (aref buffer (+ pos 14)) (aref buffer (+ src 14))))
+    (16 (setf (aref buffer (+ pos 0)) (aref buffer (+ src 0)) (aref buffer (+ pos 1)) (aref buffer (+ src 1)) (aref buffer (+ pos 2)) (aref buffer (+ src 2)) (aref buffer (+ pos 3)) (aref buffer (+ src 3)) (aref buffer (+ pos 4)) (aref buffer (+ src 4)) (aref buffer (+ pos 5)) (aref buffer (+ src 5)) (aref buffer (+ pos 6)) (aref buffer (+ src 6)) (aref buffer (+ pos 7)) (aref buffer (+ src 7)) (aref buffer (+ pos 8)) (aref buffer (+ src 8)) (aref buffer (+ pos 9)) (aref buffer (+ src 9)) (aref buffer (+ pos 10)) (aref buffer (+ src 10)) (aref buffer (+ pos 11)) (aref buffer (+ src 11)) (aref buffer (+ pos 12)) (aref buffer (+ src 12)) (aref buffer (+ pos 13)) (aref buffer (+ src 13)) (aref buffer (+ pos 14)) (aref buffer (+ src 14)) (aref buffer (+ pos 15)) (aref buffer (+ src 15))))
+    (otherwise
+     (loop for k fixnum below length do
+       (setf (aref buffer (+ pos k)) (aref buffer (+ src k))))))
   (+ pos length))
 
 (defun %copy-run-match (buffer pos length)
@@ -354,13 +399,64 @@ plain forward copying is safe, turning O(LENGTH) into O(LOG) copies."
         (incf done chunk))))
   (+ pos length))
 
-(defun %copy-inflate-match (buffer pos src distance length)
-  "Copy one match; returns the new POS.  Tiny scalar loops (the common
-case: ~60% of matches are <= 8 bytes) beat REPLACE call overhead."
+(defun %copy-inflate-match (buffer pos src distance length osap limit)
+  "Copy one match; returns the new POS.  When OSAP is the pinned bounded
+output and there is room, short matches are copied with 8/16/32/64-byte
+stores (writing a little past LENGTH is harmless: those positions are not
+live yet and will be overwritten)."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) buffer)
-           (type fixnum pos src distance length))
-  (cond ((<= length 8) (%copy-tiny-match buffer pos src length))
+           (type fixnum pos src distance length)
+           #+sbcl (type (or null sb-sys:system-area-pointer) osap)
+           #-sbcl (ignore osap)
+           (type (or null fixnum) limit)
+           #-(and sbcl cl-newzlib-le) (ignore osap limit))
+  #+(and sbcl cl-newzlib-le)
+  (when osap
+    (cond
+      ((and (<= length 8) (>= distance 8)
+            (<= (+ pos 8) (the fixnum limit)))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src))
+       (return-from %copy-inflate-match (+ pos length)))
+      ((and (<= length 16) (>= distance 16)
+            (<= (+ pos 16) (the fixnum limit)))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8)))
+       (return-from %copy-inflate-match (+ pos length)))
+      ((and (<= length 32) (>= distance 32)
+            (<= (+ pos 32) (the fixnum limit)))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8))
+             (sb-sys:sap-ref-64 osap (+ pos 16))
+             (sb-sys:sap-ref-64 osap (+ src 16))
+             (sb-sys:sap-ref-64 osap (+ pos 24))
+             (sb-sys:sap-ref-64 osap (+ src 24)))
+       (return-from %copy-inflate-match (+ pos length)))
+      ((and (<= length 64) (>= distance 64)
+            (<= (+ pos 64) (the fixnum limit)))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8))
+             (sb-sys:sap-ref-64 osap (+ pos 16))
+             (sb-sys:sap-ref-64 osap (+ src 16))
+             (sb-sys:sap-ref-64 osap (+ pos 24))
+             (sb-sys:sap-ref-64 osap (+ src 24))
+             (sb-sys:sap-ref-64 osap (+ pos 32))
+             (sb-sys:sap-ref-64 osap (+ src 32))
+             (sb-sys:sap-ref-64 osap (+ pos 40))
+             (sb-sys:sap-ref-64 osap (+ src 40))
+             (sb-sys:sap-ref-64 osap (+ pos 48))
+             (sb-sys:sap-ref-64 osap (+ src 48))
+             (sb-sys:sap-ref-64 osap (+ pos 56))
+             (sb-sys:sap-ref-64 osap (+ src 56)))
+       (return-from %copy-inflate-match (+ pos length)))))
+  (cond ((<= length 16) (%copy-tiny-match buffer pos src length))
         ((= distance 1) (%copy-run-match buffer pos length))
         ((<= length distance) (%copy-fresh-match buffer pos src length))
         (t (%copy-overlap-match buffer pos src distance length))))
@@ -373,17 +469,17 @@ bit/table locals; S is evaluated three times (pass a variable)."
      (when (> ,s 285)
        (error 'newzlib-format-error :detail "invalid length code"))
      ;; one combined load yields base and extra-bits count
-     (let* ((be (length-base+extra (- ,s 257)))
+     (let* ((be (aref lbase (- ,s 257)))
             (eb (ash be -16)))
        (declare (type (unsigned-byte 32) be) (type fixnum eb))
        (%inflate-refill eb)
        (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
          (declare (type fixnum length))
-         (let ((ds (%inflate-decode-one dist droot dfast)))
+         (let ((ds (%inflate-decode-one dist droot dfast dmask)))
            (declare (type fixnum ds))
            (when (> ds 29)
              (error 'newzlib-format-error :detail "invalid distance code"))
-           (let* ((bde (dist-base+extra ds))
+           (let* ((bde (aref dbase ds))
                   (deb (ash bde -16)))
              (declare (type (unsigned-byte 32) bde) (type fixnum deb))
              (%inflate-refill deb)
@@ -401,28 +497,28 @@ bit/table locals; S is evaluated three times (pass a variable)."
                                 :detail (format nil
                                                 "output buffer has ~D octets; ~D required"
                                                 limit (+ pos length))))
-                       (setf pos (%copy-inflate-match buffer pos src distance length)))
+                       (setf pos (%copy-inflate-match buffer pos src distance length osap limit)))
                      (multiple-value-bind (nbuffer nsize)
                          (ensure-out-capacity buffer size pos length limit)
                        (setf buffer nbuffer size nsize
-                             pos (%copy-inflate-match buffer pos src distance length))))))))))))
+                             pos (%copy-inflate-match buffer pos src distance length osap limit))))))))))))
 
 (defmacro %emit-inflate-match-unchecked (s)
   "Decode and copy a match when the caller has reserved output headroom."
   `(progn
      (when (> ,s 285)
        (error 'newzlib-format-error :detail "invalid length code"))
-     (let* ((be (length-base+extra (- ,s 257)))
+     (let* ((be (aref lbase (- ,s 257)))
             (eb (ash be -16)))
        (declare (type (unsigned-byte 32) be) (type fixnum eb))
        (%inflate-refill eb)
        (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
          (declare (type fixnum length))
-         (let ((ds (%inflate-decode-one dist droot dfast)))
+         (let ((ds (%inflate-decode-one dist droot dfast dmask)))
            (declare (type fixnum ds))
            (when (> ds 29)
              (error 'newzlib-format-error :detail "invalid distance code"))
-           (let* ((bde (dist-base+extra ds))
+           (let* ((bde (aref dbase ds))
                   (deb (ash bde -16)))
              (declare (type (unsigned-byte 32) bde) (type fixnum deb))
              (%inflate-refill deb)
@@ -433,19 +529,30 @@ bit/table locals; S is evaluated three times (pass a variable)."
                         :detail "match distance exceeds output"))
                (let ((src (- pos distance)))
                  (declare (type fixnum src))
-                 (setf pos (%copy-inflate-match buffer pos src distance length))))))))))
+                 (setf pos (%copy-inflate-match buffer pos src distance length osap limit))))))))))
 
 (defmacro %with-inflate-tables ((lit dist) &body body)
-  "Bind the fast decode-table locals used by the token loop around BODY."
+  "Bind the fast decode-table locals used by the token loop around BODY.
+MASKS is hoisted out of the per-symbol path so +LOW-BIT-MASKS+ is not
+re-read from its symbol on every decoded literal or match; LMASK/DMASK
+are the per-table low-bit masks for the literal and distance roots."
   `(let ((lroot (hdt-root ,lit)) (lfast (hdt-fast ,lit))
-         (droot (hdt-root ,dist)) (dfast (hdt-fast ,dist)))
+         (droot (hdt-root ,dist)) (dfast (hdt-fast ,dist))
+         (masks +low-bit-masks+)
+         (lbase +length-base+extra+)
+         (dbase +dist-base+extra+))
      (declare (type fixnum lroot droot)
-              (type (simple-array (unsigned-byte 16) (*)) lfast dfast))
-     ,@body))
+              (type (simple-array (unsigned-byte 16) (*)) lfast dfast)
+              (type (simple-array (unsigned-byte 64) (64)) masks)
+              (type (simple-array (unsigned-byte 32) (*)) lbase dbase))
+     (let ((lmask (aref masks lroot))
+           (dmask (aref masks droot)))
+       (declare (type (unsigned-byte 64) lmask dmask))
+       ,@body)))
 
 (defmacro %inflate-bounded-loop (while label)
   `(loop ,@(if while (list while) nil) do
-     (let ((s (%inflate-decode-one lit lroot lfast)))
+     (let ((s (%inflate-decode-one lit lroot lfast lmask)))
        (declare (type fixnum s))
        (cond
          ((< s 256)
@@ -463,13 +570,30 @@ bit/table locals; S is evaluated three times (pass a variable)."
           (return-from ,label (values buffer pos size)))
           (t (%emit-inflate-match s t))))))
 
+(defmacro %inflate-bounded-unchecked-loop (while label)
+  "Single-symbol loop for the region with +INFLATE-HEADROOM+ to spare."
+  `(loop do
+     (unless ,while (return))
+     (let ((s (%inflate-decode-one lit lroot lfast lmask)))
+       (declare (type fixnum s))
+       (cond
+         ((< s 256)
+          (setf (aref buffer pos) s)
+          (incf pos))
+         ((= s 256)
+          (setf (br-accum reader) accum
+                (br-nbits reader) nbits
+                (br-pos reader) rpos)
+          (return-from ,label (values buffer pos size)))
+         (t (%emit-inflate-match-unchecked s))))))
+
 (defmacro %inflate-bounded-paired-loop (while label)
   `(loop ,@(if while (list while) nil) do
-     (let ((s1 (%inflate-decode-one lit lroot lfast)))
+     (let ((s1 (%inflate-decode-one lit lroot lfast lmask)))
        (declare (type fixnum s1))
        (cond
          ((< s1 256)
-          (let ((s2 (%inflate-decode-one lit lroot lfast)))
+          (let ((s2 (%inflate-decode-one lit lroot lfast lmask)))
             (declare (type fixnum s2))
             (cond
               ((< s2 256)
@@ -500,11 +624,11 @@ bit/table locals; S is evaluated three times (pass a variable)."
        (multiple-value-bind (nbuffer nsize)
            (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
          (setf buffer nbuffer size nsize)))
-     (let ((s1 (%inflate-decode-one lit lroot lfast)))
+     (let ((s1 (%inflate-decode-one lit lroot lfast lmask)))
        (declare (type fixnum s1))
        (cond
          ((< s1 256)
-          (let ((s2 (%inflate-decode-one lit lroot lfast)))
+          (let ((s2 (%inflate-decode-one lit lroot lfast lmask)))
             (declare (type fixnum s2))
             (cond
               ((< s2 256)
@@ -540,10 +664,14 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
            (type (or null fixnum) limit))
   (let ((accum (br-accum reader)) (nbits (br-nbits reader))
         (rpos (br-pos reader)) (rend (br-end reader))
-        (rbuf (br-buffer reader)))
+        (rbuf (br-buffer reader))
+        (masks +low-bit-masks+)
+        (osap nil))
     (declare (type (unsigned-byte 64) accum)
              (type fixnum nbits rpos rend)
-             (type (simple-array (unsigned-byte 8) (*)) rbuf))
+             (type (simple-array (unsigned-byte 8) (*)) rbuf)
+             (type (simple-array (unsigned-byte 64) (64)) masks)
+             (type null osap))
     ;; Pin the input once: refills below allocate nothing (no per-refill
     ;; SAP consing), so no GC intervenes; output growth never moves RBUF.
     (with-pinned-input (rsap rbuf)
@@ -564,11 +692,23 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
     (declare (type (unsigned-byte 64) accum)
              (type fixnum nbits rpos rend size))
     (with-pinned-input (rsap rbuf)
-      (%with-inflate-tables (lit dist)
-        (block decode-done
-          (%inflate-bounded-paired-loop
-           (<= (+ pos +inflate-headroom+) limit) decode-done)
-          (%inflate-bounded-loop nil decode-done))))))
+      #+sbcl
+      (sb-sys:with-pinned-objects (buffer)
+        (let ((osap (sb-sys:vector-sap buffer)))
+          (declare (type sb-sys:system-area-pointer osap))
+          (%with-inflate-tables (lit dist)
+            (block decode-done
+              (%inflate-bounded-unchecked-loop
+               (<= (+ pos +inflate-headroom+) limit) decode-done)
+              (%inflate-bounded-loop nil decode-done)))))
+      #-sbcl
+      (let ((osap nil))
+        (declare (type null osap))
+        (%with-inflate-tables (lit dist)
+          (block decode-done
+            (%inflate-bounded-unchecked-loop
+             (<= (+ pos +inflate-headroom+) limit) decode-done)
+            (%inflate-bounded-loop nil decode-done)))))))
 
 (defun %inflate-token-stream (reader buffer size pos lit dist limit)
   (declare (optimize (speed 3) (safety 0))
@@ -590,10 +730,12 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
   (declare (optimize (speed 3) (safety 0)))
   (let ((accum (br-accum reader)) (nbits (br-nbits reader))
         (rpos (br-pos reader)) (rend (br-end reader))
-        (rbuf (br-buffer reader)))
+        (rbuf (br-buffer reader))
+        (masks +low-bit-masks+))
     (declare (type (unsigned-byte 64) accum)
              (type fixnum nbits rpos rend)
-             (type (simple-array (unsigned-byte 8) (*)) rbuf))
+             (type (simple-array (unsigned-byte 8) (*)) rbuf)
+             (type (simple-array (unsigned-byte 64) (64)) masks))
     (with-pinned-input (rsap rbuf)
       (%inflate-refill 5)
       (let ((hlit (+ (%inflate-take 5) 257)))
@@ -618,6 +760,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                               cl-lengths 0 19 nil))
                      (clroot (hdt-root cl-tree))
                      (clfast (hdt-fast cl-tree))
+                     (clmask (aref masks (hdt-root cl-tree)))
                      (lengths (if scratch
                                   (progn
                                     (fill (is-lengths scratch) 0)
@@ -639,7 +782,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                              (setf (aref lengths i) value)
                              (incf i))))
                   (loop while (< i total) do
-                    (let ((sym (%inflate-decode-one cl-tree clroot clfast)))
+                    (let ((sym (%inflate-decode-one cl-tree clroot clfast clmask)))
                       (declare (type fixnum sym))
                       (cond
                         ((< sym 16)
@@ -665,7 +808,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                       (br-nbits reader) nbits
                       (br-pos reader) rpos)
                 (values (build-huffman-decode-table lengths 0 hlit nil)
-                        (build-huffman-decode-table lengths hlit hdist nil)))))))))))
+                        (build-huffman-decode-table lengths hlit hdist 9)))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Block driver
@@ -705,14 +848,10 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
       (iterate:leave (values buffer pos size))))
   (values buffer pos size))
 
-(defun inflate-raw (input &optional (start 0) (end (length input)))
-  "Decompress a raw DEFLATE stream INPUT[START,END).  Returns a fresh
-  octet vector; decoding runs in a pooled scratch buffer (only the
-  exact-size result is allocated per call)."
+(defun inflate-raw-growable (input start end)
+  "Growable-output fallback for INFLATE-RAW."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
-  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
-    (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
   (let ((reader (make-bit-reader input start end))
         (buffer (acquire-output-buffer))
         (scratch (acquire-inflate-scratch))
@@ -730,6 +869,33 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                result))
         (release-output-buffer buffer)
         (release-inflate-scratch scratch)))))
+
+(defun inflate-raw (input &optional (start 0) (end (length input)))
+  "Decompress a raw DEFLATE stream INPUT[START,END).  Returns a fresh
+  octet vector.  A size guess (4x compressed size) lets the usual case use
+  the bounded, SAP-fast decoder; incompressible/very-compressible streams
+  fall back to growable decoding."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end))
+  (unless (typep input '(simple-array (unsigned-byte 8) (*)))
+    (error 'newzlib-parameter-error :detail "input must be an (unsigned-byte 8) vector"))
+  (let* ((n (- end start))
+         (guess (max +inflate-start-size+ (+ 65536 (* 4 n))))
+         (buffer (acquire-output-buffer)))
+    (declare (type fixnum n guess))
+    (when (< (length buffer) guess)
+      (release-output-buffer buffer)
+      (setf buffer (make-octet-buffer guess)))
+    (unwind-protect
+         (handler-case
+             (let ((pos (inflate-raw-into buffer input start end)))
+               (declare (type fixnum pos))
+               (let ((result (make-octet-buffer pos)))
+                 (replace result buffer :end2 pos)
+                 result))
+           (newzlib-parameter-error ()
+             (inflate-raw-growable input start end)))
+      (release-output-buffer buffer))))
 
 (defun inflate-raw-into (output input &optional (start 0) (end (length input)))
   (declare (type (simple-array (unsigned-byte 8) (*)) output input)

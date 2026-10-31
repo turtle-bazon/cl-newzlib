@@ -140,6 +140,18 @@ and unfolded initial sums."
                                    (ldb (byte 16 16) init)))
                 (return-from simd-adler-self-test-p nil))))))))
 
-  (when (and (simd-adler-cpu-available-p)
-             (handler-case (simd-adler-self-test-p) (error () nil)))
-    (setf *simd-adler-impl* #'adler32-vector)))
+  (defvar *simd-adler-self-test-passed*
+    (and (simd-adler-cpu-available-p)
+         (handler-case (simd-adler-self-test-p) (error () nil))))
+
+  (defun update-simd-adler-impl ()
+    "Select the Adler implementation for the current CPU.  Also called from
+SB-EXT:*INIT-HOOKS* so an image built on one machine falls back safely when
+restarted on another without AVX2."
+    (setf *simd-adler-impl*
+          (when (and *simd-adler-self-test-passed*
+                     (simd-adler-cpu-available-p))
+            #'adler32-vector)))
+
+  (update-simd-adler-impl)
+  #+sbcl (pushnew 'update-simd-adler-impl sb-ext:*init-hooks*))

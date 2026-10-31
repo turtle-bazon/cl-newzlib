@@ -210,14 +210,28 @@ BASE | EXTRA<<16."
 ;;; Bit reversal for canonical codes.  Defined before the table builder so
 ;;; its calls there open-code (it is also used by the static-tree code
 ;;; below).  The loop is tiny; the builder calls it once per short symbol.
+(defparameter +reverse-byte+
+  (let ((v (make-array 256 :element-type '(unsigned-byte 8))))
+    (dotimes (i 256 v)
+      (let ((x i) (r 0))
+        (declare (type fixnum x r))
+        (dotimes (k 8)
+          (declare (ignore k))
+          (setf r (logior (ash r 1) (logand x 1))
+                x (ash x -1)))
+        (setf (aref v i) r)))))
+
+(declaim (type (simple-array (unsigned-byte 8) (256)) +reverse-byte+))
+
 (defun reverse-bits (code len)
   (declare (optimize (speed 3) (safety 0))
            (type fixnum code len))
-  (let ((res 0))
-    (declare (type fixnum res))
-    (dotimes (i len res)
-      (setf res (logior (ash res 1) (logand code 1))
-            code (ash code -1)))))
+  (if (<= len 8)
+      (ash (aref +reverse-byte+ code) (- len 8))
+      (let ((lo (aref +reverse-byte+ (logand code #xFF)))
+            (hi (aref +reverse-byte+ (logand (ash code -8) #xFF))))
+        (declare (type fixnum lo hi))
+        (ash (logior (ash lo 8) hi) (- len 16)))))
 
 (declaim (inline reverse-bits))
 

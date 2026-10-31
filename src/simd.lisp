@@ -114,6 +114,19 @@
         (:sse4.1 (%leading-equal-octets/sse2 input a b limit))
         (:x86-64 (leading-equal-octets/scalar input a b limit))))))
 
+#+newzlib-simd
+(defun select-leading-equal-octets ()
+  "Return the best implementation available on the current CPU.  Called once
+per compression, so image migration/restart picks up the new CPU features."
+  (sb-simd-internals:instruction-set-case
+    (:avx2 #'%leading-equal-octets/avx2)
+    (:sse4.1 #'%leading-equal-octets/sse2)
+    (:x86-64 #'leading-equal-octets/scalar)))
+
+#-newzlib-simd
+(defun select-leading-equal-octets ()
+  #'leading-equal-octets)
+
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (*))
                            fixnum fixnum fixnum)
                           fixnum)

@@ -257,10 +257,14 @@ growth steps; steady state reuses high-water buffers anyway.")
              rpos (1+ rpos)))))
 
 (defmacro %inflate-take (n)
-  "Consume N bits (caller guarantees NBITS >= N); returns a fixnum."
-  `(prog1 (definitely-the fixnum (logand accum (aref masks ,n)))
-     (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
-           nbits (- nbits ,n))))
+  "Consume N bits (caller guarantees NBITS >= N); returns a fixnum.  A
+zero-bit take is free and common (short match lengths), so branch around the
+mask load and accumulator shift for it."
+  `(if (eql ,n 0)
+       0
+       (prog1 (definitely-the fixnum (logand accum (aref masks ,n)))
+         (setf accum (definitely-the (unsigned-byte 64) (ash accum (- ,n)))
+               nbits (- nbits ,n)))))
 
 (defmacro %inflate-decode-slow (table root mask)
   "Canonical bit walk for codes longer than ROOT; yields the symbol value.
@@ -638,7 +642,10 @@ are the per-table low-bit masks for the literal and distance roots."
               (type (simple-array (unsigned-byte 32) (*)) lbase dbase))
      (let ((lmask (aref masks lroot))
            (dmask (aref masks droot)))
-       (declare (type (unsigned-byte 64) lmask dmask))
+       ;; ROOT <= 12, so these masks fit in 32 bits; declaring them so keeps
+       ;; LOGAND's result inside fixnum range and removes the conversion
+       ;; SBCL would otherwise emit before indexing FAST.
+       (declare (type (unsigned-byte 32) lmask dmask))
        ,@body)))
 
 (defmacro %inflate-bounded-loop (while label)

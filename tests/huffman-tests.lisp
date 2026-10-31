@@ -84,7 +84,9 @@
       (is (plusp (aref lengths 1)))
       (is (= 0 (aref lengths 2)))
       (loop for i below 3
-            do (is (< (aref codes i) (expt 2 (aref lengths i))))))))
+            ;; Codes for zero-length (unused) symbols are unspecified.
+            when (plusp (aref lengths i))
+              do (is (< (aref codes i) (expt 2 (aref lengths i))))))))
 
 (test decode-table-kraft-reject
   ;; code lengths violating Kraft's inequality must be rejected

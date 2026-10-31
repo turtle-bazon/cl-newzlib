@@ -5,8 +5,8 @@
 ;;;
 ;;;   * other Lisps / architectures get the plain scalar definitions,
 ;;;   * SBCL builds whose contrib is missing get a scalar definition,
-;;;   * x86-64 CPUs without AVX2 take the SSE2 path (baseline on x86-64),
-;;;     selected at image startup by sb-simd's INSTRUCTION-SET-CASE.
+;;;   * x86-64 CPUs without AVX2 take the SSE4.1 or scalar path, selected at
+;;;     runtime by SB-CPU-FEATURES (and re-selected after image restart).
 ;;;
 ;;; The feature gate :newzlib-simd is pushed in util.lisp (loaded earlier).
 ;;; The vector loads go through sb-simd's AREF interface, which re-derives
@@ -108,17 +108,16 @@
             do (incf n))
       n))
 
-  (defun select-leading-equal-octets ()
-    "Return the best implementation usable on the current CPU.  AVX2 is
-gated on both CPUID and OS XMM/YMM state (AVX2-USABLE-P); SSE4.1 is gated
-by sb-simd's dispatch.  Called once per compression, so image migration and
-restart re-evaluate the current machine."
+  ;; Selection goes through SB-CPU-FEATURES, so the runtime check and the
+  ;; masking macros match the rest of the library.  AVX2 is gated on both
+  ;; CPUID and OS XMM/YMM state; SSE4.1 is gated on its CPUID bit.  Called
+  ;; once per compression, so image migration and restart re-evaluate the
+  ;; current machine.
+  (sb-cpu-features:define-cpu-dispatch select-leading-equal-octets
     #+newzlib-avx2
-    (when (avx2-usable-p)
-      (return-from select-leading-equal-octets #'%leading-equal-octets/avx2))
-    (sb-simd-internals:instruction-set-case
-      (:sse4.1 #'%leading-equal-octets/sse2)
-      (:x86-64 #'leading-equal-octets/scalar)))
+    (:avx2 %leading-equal-octets/avx2)
+    (:sse4.1 %leading-equal-octets/sse2)
+    (:default leading-equal-octets/scalar))
 
   (declaim (inline leading-equal-octets))
   (defun leading-equal-octets (input a b limit)

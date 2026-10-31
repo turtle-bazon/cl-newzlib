@@ -154,5 +154,6 @@ around 0.9-1.0x.  Binary inflate is the remaining small gap.
 
 ## Status
 
-The full suite passes on SBCL 2.6.7 and 2.6.9 (1572 checks with AVX2 compiled;
-the non-AVX2 build configuration is also tested).
+The full suite passes on SBCL 2.6.7 and 2.6.9 (1574 checks with AVX2 compiled;
+the non-AVX2 build configuration is also tested).  It also passes on ECL
+21.2.1 and CCL 1.13 (1495 checks; SBCL-only paths are skipped).

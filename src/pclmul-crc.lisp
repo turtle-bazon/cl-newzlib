@@ -20,8 +20,9 @@
 ;;;   Anything else -- no PCLMULQDQ flag, VOP trouble, self-test mismatch --
 ;;;   leaves *pclmul-crc-impl* NIL and the library silently keeps slicing.
 ;;;   (The whole file is inert without SBCL/x86-64 little-endian plus
-;;;   sb-simd: the x86-64 gate matters because the VOP emitters and sb-simd's
-;;;   CPUID helper exist only there.)
+;;;   PCLMULQDQ at build time; the x86-64 gate matters because the VOP
+;;;   emitters and sb-simd's vector packages exist only there.  Availability
+;;;   is probed through SB-CPU-FEATURES.)
 
 #+(and sbcl x86-64 cl-newzlib-le newzlib-pclmul)
 (progn

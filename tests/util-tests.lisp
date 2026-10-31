@@ -166,15 +166,25 @@
 #+(and sbcl newzlib-avx2)
 (test avx2-os-state-gate
   ;; CPUID can advertise AVX2 while the OS has not enabled YMM state.
-  ;; The runtime selector must then avoid the AVX2 implementation.
-  (let ((orig (symbol-function 'cl-newzlib::avx2-usable-p)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'cl-newzlib::avx2-usable-p)
-                 (lambda () nil))
-           (is (not (eq (cl-newzlib::select-leading-equal-octets)
-                        #'cl-newzlib::%leading-equal-octets/avx2)))
-           (cl-newzlib::update-simd-adler-impl)
-           (is (null cl-newzlib::*simd-adler-impl*)))
-      (setf (symbol-function 'cl-newzlib::avx2-usable-p) orig)
-      (cl-newzlib::update-simd-adler-impl))))
+  ;; Masking :AVX2 makes the shared feature layer report it unavailable,
+  ;; so the runtime selector must avoid the AVX2 implementation.
+  (sb-cpu-features:with-cpu-features-disabled (:avx2)
+    (is (not (eq (cl-newzlib::select-leading-equal-octets)
+                 #'cl-newzlib::%leading-equal-octets/avx2)))
+    (cl-newzlib::update-simd-adler-impl)
+    (is (null cl-newzlib::*simd-adler-impl*)))
+  (cl-newzlib::update-simd-adler-impl))
+
+#+(and sbcl newzlib-simd)
+(test sse41-dispatch-uses-cpu-features
+  ;; With every feature masked, the matcher must fall back to scalar.
+  (sb-cpu-features:with-cpu-features-only '()
+    (is (eq (cl-newzlib::select-leading-equal-octets)
+            #'cl-newzlib::leading-equal-octets/scalar))))
+
+#+(and sbcl newzlib-pclmul)
+(test pclmul-availability-uses-cpu-features
+  (is (eq (not (null (cl-newzlib::pclmul-cpu-available-p)))
+          (not (null (sb-cpu-features:cpu-feature-p :pclmulqdq)))))
+  (sb-cpu-features:with-cpu-features-disabled (:pclmulqdq)
+    (is (not (cl-newzlib::pclmul-cpu-available-p)))))

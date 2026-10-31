@@ -229,8 +229,8 @@ iteration instead of one lookup per byte."
               (declare (type (unsigned-byte 32) w0 w1))
               (setf c (%crc32-fold8 (logxor c w0) w1
                                     t0 t1 t2 t3 t4 t5 t6 t7)))
-            (incf i 8)
-          (setf c (%crc32-tail8 c octets i end t0)))))
+            (incf i 8))
+          (setf c (%crc32-tail8 c octets i end t0))))
       (logxor c #xFFFFFFFF))))
 
 #-(or (and sbcl cl-newzlib-le) cl-newzlib-wide-fixnum)

@@ -956,6 +956,7 @@ fields on every code."
       (loop for i below nsym do
         (let* ((token (aref tokens i))
                (s (token-symbol token)))
+          (declare (type (unsigned-byte 9) s))
           (if (> s 256)
               (progn
                 (emit (aref lit-codes s) (aref lit-lengths s))

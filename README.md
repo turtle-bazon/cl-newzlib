@@ -147,25 +147,25 @@ and its constructor is always `notinline`.  Any new AVX2 code should keep
 constant-foldable arguments out of AVX2 constructor calls.
 
 On the development machine (Intel Xeon Skylake, zlib 1.2.13, 2 MiB inputs,
-SBCL 2.6.7 and 2.6.9), the streaming `into` API gives:
+SBCL 2.6.9), the streaming `into` API gives:
 
 | dataset | compress (into) | decompress (into) |
 |---------|----------------:|------------------:|
-| text | 1.17-1.27x | 0.88-0.97x |
-| binary | 1.56-1.75x | 0.83-0.93x |
-| zeroes | 2.83-3.46x | 1.75-1.93x |
-| random | 1.00-1.25x | 1.30-1.40x |
-| **geometric mean** | **1.55-1.71x** | **1.15-1.19x** |
+| text | 1.34x | 0.87x |
+| binary | 1.80x | 0.91x |
+| zeroes | 3.13x | 1.69x |
+| random | 1.12x | 1.23x |
+| **geometric mean** | **1.70x** | **1.13x** |
 
-Compression is at or above zlib at every level except level 1 on binary
-data (0.93-0.97x).  Level 3 reaches 1.2-1.4x, levels 6/9 reach 1.3-1.7x,
-and binary level 9 is 3.9-4.1x.  Decompression is 0.88-0.97x on text and
-0.83-0.93x on binary; zeroes and random decompress faster than zlib.
-One-shot decompression is 0.87-0.90x overall; binary and stored-block
-inflate are the remaining gaps.
+Compression is at or above zlib at every level: text 1.13x/1.30x/1.45x/1.50x
+and binary 1.03x/1.49x/1.64x/4.21x at levels 1/3/6/9.  Decompression is
+0.78-0.96x on text and 0.84-0.96x on binary; zeroes and random decompress
+faster than zlib.  One-shot compression is 1.69x, one-shot decompression
+0.88x overall (the latter must allocate a fresh result per call, which the
+harness's zlib side avoids).
 
 ## Status
 
-The full suite passes on SBCL 2.6.7 and 2.6.9 (1574 checks with AVX2 compiled;
-the non-AVX2 build configuration is also tested).  It also passes on ECL
-21.2.1 and CCL 1.13 (1495 checks; SBCL-only paths are skipped).
+The full suite passes on SBCL 2.6.9 (1574 checks with AVX2 compiled; the
+non-AVX2 build configuration is also tested).  It also passes on ECL 21.2.1
+and CCL 1.13 (1495 checks; SBCL-only paths are skipped).

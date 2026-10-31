@@ -587,42 +587,34 @@ adopt it only if no longer match starts on the next byte."
            (type (simple-array fixnum (*)) lit-freq dist-freq)
            (type fixnum start end nice good max-chain max-lazy token-capacity)
            (type function eq-fn))
-  (let ((nsym 0) (extra-bits 0) (pos start)
-        (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
-    (declare (type fixnum nsym extra-bits pos hash-pos hash-value
-                        hash-a hash-b hash-c))
+  (let ((nsym 0) (extra-bits 0) (pos start))
+    (declare (type fixnum nsym extra-bits pos))
     (with-pinned-input (isap input)
       (loop while (< pos end) do
         (if (< (- end pos) +min-match+)
             (progn
               (%emit-literal pos)
-              (incf pos)
-              (setf hash-pos -1))
-            (progn
-              (%ensure-hash-state)
-              (let ((cand (insert-string-hash pos hash-value head prev)))
-                (declare (type fixnum cand))
-                (if (= cand #xFFFFFFFF)
-                    (progn
-                      (%emit-literal pos)
-                      (incf pos)
-                      (%advance-hash-state))
-                    (multiple-value-bind (len d)
-                        (longest-match input pos end cand head prev
-                                       max-chain nice good (1- +min-match+)
-                                       isap eq-fn)
-                      (if (>= len +min-match+)
-                          (progn
-                            (%emit-match len d)
-                            (when (<= len max-lazy)
-                              (%insert-match-interior pos len (1+ pos)))
-                            (incf pos len)
-                            (setf hash-pos -1))
-                          (progn
-                            (%emit-literal pos)
-                            (incf pos)
-                             (%advance-hash-state)))))))))
-     (values nsym extra-bits tokens token-capacity))))
+              (incf pos))
+            (let ((cand (insert-string input pos head prev)))
+              (declare (type fixnum cand))
+              (if (= cand #xFFFFFFFF)
+                  (progn
+                    (%emit-literal pos)
+                    (incf pos))
+                  (multiple-value-bind (len d)
+                      (longest-match input pos end cand head prev
+                                     max-chain nice good (1- +min-match+)
+                                     isap eq-fn)
+                    (if (>= len +min-match+)
+                        (progn
+                          (%emit-match len d)
+                          (when (<= len max-lazy)
+                            (%insert-match-interior pos len (1+ pos)))
+                          (incf pos len))
+                        (progn
+                          (%emit-literal pos)
+                          (incf pos))))))))
+    (values nsym extra-bits tokens token-capacity))))
 
 (defun %lz77-search (input start end nice good max-chain max-lazy lazy-p
                      tokens token-capacity head prev lit-freq dist-freq eq-fn)

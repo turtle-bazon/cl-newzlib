@@ -45,7 +45,10 @@
             (:constructor %make-inflate-scratch)
             (:conc-name is-))
   (cl-lengths nil :type (simple-array fixnum (19)))
-  (lengths nil :type (simple-array fixnum (*))))
+  (lengths nil :type (simple-array fixnum (*)))
+  (cl-table-scratch nil :type decode-scratch)
+  (lit-table-scratch nil :type decode-scratch)
+  (dist-table-scratch nil :type decode-scratch))
 
 (defparameter *inflate-scratch-pool* '())
 (defparameter *inflate-scratch-pool-max* 4)
@@ -54,7 +57,10 @@
   (%make-inflate-scratch
    :cl-lengths (make-array 19 :element-type 'fixnum :initial-element 0)
    :lengths (make-array +max-dynamic-lengths+ :element-type 'fixnum
-                        :initial-element 0)))
+                        :initial-element 0)
+   :cl-table-scratch (make-decode-scratch)
+   :lit-table-scratch (make-decode-scratch)
+   :dist-table-scratch (make-decode-scratch)))
 
 (defun acquire-inflate-scratch ()
   (or (with-scratch-lock (pop *inflate-scratch-pool*))
@@ -305,6 +311,23 @@ fast path (no symbol store/load roundtrip through memory)."
                    nbits (- nbits clen))
              (logand entry #x1FF))))))
 
+(defmacro %inflate-decode-one-full (table root fast mask)
+  "Decode one symbol after ensuring 15 bits are buffered.  The common case
+needs no second refill; the truncated-tail check replaces it."
+  `(progn
+     (%inflate-fill 15)
+     (let ((entry (aref ,fast (logand accum ,mask))))
+       (declare (type fixnum entry))
+       (if (zerop entry)
+           (%inflate-decode-slow ,table ,root ,mask)
+           (let ((clen (ash entry -9)))
+             (declare (type fixnum clen))
+             (when (< nbits clen)
+               (error 'newzlib-end-of-input))
+             (setf accum (definitely-the (unsigned-byte 64) (ash accum (- clen)))
+                   nbits (- nbits clen))
+             (logand entry #x1FF))))))
+
 (declaim (inline %copy-tiny-match %copy-run-match %copy-fresh-match
                  %copy-overlap-match %copy-inflate-match))
 
@@ -475,7 +498,7 @@ bit/table locals; S is evaluated three times (pass a variable)."
        (%inflate-refill eb)
        (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
          (declare (type fixnum length))
-         (let ((ds (%inflate-decode-one dist droot dfast dmask)))
+         (let ((ds (%inflate-decode-one-full dist droot dfast dmask)))
            (declare (type fixnum ds))
            (when (> ds 29)
              (error 'newzlib-format-error :detail "invalid distance code"))
@@ -514,7 +537,7 @@ bit/table locals; S is evaluated three times (pass a variable)."
        (%inflate-refill eb)
        (let ((length (+ (logand be #xFFFF) (%inflate-take eb))))
          (declare (type fixnum length))
-         (let ((ds (%inflate-decode-one dist droot dfast dmask)))
+         (let ((ds (%inflate-decode-one-full dist droot dfast dmask)))
            (declare (type fixnum ds))
            (when (> ds 29)
              (error 'newzlib-format-error :detail "invalid distance code"))
@@ -552,7 +575,7 @@ are the per-table low-bit masks for the literal and distance roots."
 
 (defmacro %inflate-bounded-loop (while label)
   `(loop ,@(if while (list while) nil) do
-     (let ((s (%inflate-decode-one lit lroot lfast lmask)))
+     (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
        (declare (type fixnum s))
        (cond
          ((< s 256)
@@ -561,7 +584,8 @@ are the per-table low-bit masks for the literal and distance roots."
                    :detail (format nil
                                    "output buffer has ~D octets; ~D required"
                                    limit (1+ pos))))
-          (setf (aref buffer pos) s)
+          #+sbcl (setf (sb-sys:sap-ref-8 osap pos) s)
+          #-sbcl (setf (aref buffer pos) s)
           (incf pos))
          ((= s 256)
           (setf (br-accum reader) accum
@@ -574,11 +598,12 @@ are the per-table low-bit masks for the literal and distance roots."
   "Single-symbol loop for the region with +INFLATE-HEADROOM+ to spare."
   `(loop do
      (unless ,while (return))
-     (let ((s (%inflate-decode-one lit lroot lfast lmask)))
+     (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
        (declare (type fixnum s))
        (cond
          ((< s 256)
-          (setf (aref buffer pos) s)
+          #+sbcl (setf (sb-sys:sap-ref-8 osap pos) s)
+          #-sbcl (setf (aref buffer pos) s)
           (incf pos))
          ((= s 256)
           (setf (br-accum reader) accum
@@ -589,11 +614,11 @@ are the per-table low-bit masks for the literal and distance roots."
 
 (defmacro %inflate-bounded-paired-loop (while label)
   `(loop ,@(if while (list while) nil) do
-     (let ((s1 (%inflate-decode-one lit lroot lfast lmask)))
+     (let ((s1 (%inflate-decode-one-full lit lroot lfast lmask)))
        (declare (type fixnum s1))
        (cond
          ((< s1 256)
-          (let ((s2 (%inflate-decode-one lit lroot lfast lmask)))
+          (let ((s2 (%inflate-decode-one-full lit lroot lfast lmask)))
             (declare (type fixnum s2))
             (cond
               ((< s2 256)
@@ -624,11 +649,11 @@ are the per-table low-bit masks for the literal and distance roots."
        (multiple-value-bind (nbuffer nsize)
            (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
          (setf buffer nbuffer size nsize)))
-     (let ((s1 (%inflate-decode-one lit lroot lfast lmask)))
+     (let ((s1 (%inflate-decode-one-full lit lroot lfast lmask)))
        (declare (type fixnum s1))
        (cond
          ((< s1 256)
-          (let ((s2 (%inflate-decode-one lit lroot lfast lmask)))
+          (let ((s2 (%inflate-decode-one-full lit lroot lfast lmask)))
             (declare (type fixnum s2))
             (cond
               ((< s2 256)
@@ -757,7 +782,8 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                 (setf (aref cl-lengths (aref +code-length-order+ i))
                       (%inflate-take 3)))
               (let* ((cl-tree (build-huffman-decode-table
-                              cl-lengths 0 19 nil))
+                              cl-lengths 0 19 nil
+                              (and scratch (is-cl-table-scratch scratch))))
                      (clroot (hdt-root cl-tree))
                      (clfast (hdt-fast cl-tree))
                      (clmask (aref masks (hdt-root cl-tree)))
@@ -807,8 +833,12 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                 (setf (br-accum reader) accum
                       (br-nbits reader) nbits
                       (br-pos reader) rpos)
-                (values (build-huffman-decode-table lengths 0 hlit nil)
-                        (build-huffman-decode-table lengths hlit hdist 9)))))))))))
+                (values (build-huffman-decode-table
+                                 lengths 0 hlit nil
+                                 (and scratch (is-lit-table-scratch scratch)))
+                        (build-huffman-decode-table
+                         lengths hlit hdist 9
+                         (and scratch (is-dist-table-scratch scratch)))))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Block driver

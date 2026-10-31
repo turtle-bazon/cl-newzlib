@@ -95,7 +95,7 @@
     ;; levels 3/6/9 use shorter chains (level 9 also halves NICE/LAZY below).
     (if (> size +large-deflate-input+)
         (case level
-          (3 24)
+          (3 6)
           (6 24)
           (7 48)
           (8 192)
@@ -184,7 +184,8 @@ like zlib's INSERT_STRING match_head)."
                           fixnum)
                  %lm-extend))
 
-(declaim (inline %lm-limits %lm-candidate-ok-p %lm-extend %lm-bestpair-ok-p))
+(declaim (inline %lm-limits %lm-candidate-ok-p %lm-candidate-ok-full-p
+                 %lm-extend %lm-bestpair-ok-p))
 #+(and sbcl cl-newzlib-le)
 (declaim (inline %lm-bestpair-sap))
 
@@ -230,6 +231,18 @@ usually never execute.  ISAP is the pinned input SAP (SBCL only)."
        (= p0 (aref input cand))
        (= p1 (aref input (1+ cand)))))
 
+(defun %lm-candidate-ok-full-p (input pos cand best p0 p1 isap)
+  "Candidate check when POS is far enough from END that no bounds test is
+needed.  P0/P1 are the bytes already loaded at POS by the caller."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum pos cand best p0 p1)
+           #-(and sbcl cl-newzlib-le) (ignore isap))
+  (and #+(and sbcl cl-newzlib-le) (%lm-bestpair-sap isap pos cand best)
+       #-(and sbcl cl-newzlib-le) (%lm-bestpair-ok-p input pos cand best)
+       (= p0 (aref input cand))
+       (= p1 (aref input (1+ cand)))))
+
 (defun %lm-extend (input pos cand limit eq-fn)
   "Full extension length from offset 2 via bulk compare (SIMD-backed; a
 scalar-first probe was tried and netted negative, so kept SIMD)."
@@ -252,6 +265,7 @@ DISTANCE), inlining at both search sites; args side-effect-free."
         (g-nice (gensym "NICE")) (g-good (gensym "GOOD")) (g-best (gensym "BEST"))
         (g-dist (gensym "DIST")) (g-chain (gensym "CHAIN")) (g-isap (gensym "ISAP"))
         (g-p0 (gensym "P0")) (g-p1 (gensym "P1")) (g-cand (gensym "CAND")) (g-len (gensym "LEN"))
+        (g-full (gensym "FULL"))
         (g-eq (gensym "EQ")))
     `(let ((,g-input ,input) (,g-pos ,pos) (,g-end ,end) (,g-res ,first-res)
            (,g-prev ,prev) (,g-max ,max-chain) (,g-nice ,nice) (,g-good ,good)
@@ -265,7 +279,8 @@ DISTANCE), inlining at both search sites; args side-effect-free."
        (multiple-value-bind (limit window maxc)
            (%lm-limits ,g-pos ,g-end ,g-best ,g-good ,g-max)
          (declare (type fixnum limit window maxc))
-         (let ((,g-p0 (aref ,g-input ,g-pos)) (,g-p1 (aref ,g-input (1+ ,g-pos))))
+         (let ((,g-p0 (aref ,g-input ,g-pos)) (,g-p1 (aref ,g-input (1+ ,g-pos)))
+               (,g-full (<= (+ ,g-pos +max-match+) ,g-end)))
            (declare (type fixnum ,g-p0 ,g-p1))
            (loop
              (when (or (= ,g-res #xFFFFFFFF) (< ,g-res window)
@@ -274,8 +289,11 @@ DISTANCE), inlining at both search sites; args side-effect-free."
              (incf ,g-chain)
              (let ((,g-cand ,g-res))
                (declare (type fixnum ,g-cand))
-               (when (%lm-candidate-ok-p ,g-input ,g-pos ,g-end ,g-cand
-                                         ,g-best ,g-p0 ,g-p1 ,g-isap)
+               (when (if ,g-full
+                         (%lm-candidate-ok-full-p ,g-input ,g-pos ,g-cand
+                                                   ,g-best ,g-p0 ,g-p1 ,g-isap)
+                         (%lm-candidate-ok-p ,g-input ,g-pos ,g-end ,g-cand
+                                             ,g-best ,g-p0 ,g-p1 ,g-isap))
                  (let ((,g-len (%lm-extend ,g-input ,g-pos ,g-cand limit ,g-eq)))
                    (declare (type fixnum ,g-len))
                    (when (> ,g-len ,g-best)
@@ -807,31 +825,6 @@ code, then for matches the length extra, distance code and distance extra."
             (incf bits (aref dist-len-array (token-distance-code token)))))))
     bits))
 
-(defun data-bits/dynamic-and-fixed (tokens nsym dyn-lens fixed-lens
-                                     dist-dyn-lens dist-fixed-lens extra-bits)
-  "Like DATA-BITS twice: returns (VALUES DYN-BITS FIXED-BITS) computing both
-size estimates in a single pass over the tokens."
-  (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 32) (*)) tokens)
-           (type (simple-array fixnum (*)) dyn-lens fixed-lens
-                 dist-dyn-lens dist-fixed-lens)
-           (type fixnum nsym extra-bits))
-  (let ((dyn extra-bits)
-        (fixed extra-bits))
-    (declare (type fixnum dyn fixed))
-    (loop for i below nsym do
-      (let* ((token (aref tokens i))
-             (s (token-symbol token)))
-        (declare (type fixnum s))
-        (incf dyn (aref dyn-lens s))
-        (incf fixed (aref fixed-lens s))
-        (when (> s 256)
-          (let ((d (token-distance-code token)))
-            (declare (type fixnum d))
-            (incf dyn (aref dist-dyn-lens d))
-            (incf fixed (aref dist-fixed-lens d))))))
-    (values dyn fixed)))
-
 (declaim (inline %bl-run-limits %bl-push-verbatim %bl-push-repeat
                  %bl-push-zeros))
 
@@ -1038,22 +1031,21 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
           (values nbl bl-extra hclen bl-code-bits))))))
 
 (defun %emit-cheapest (writer input start end scratch nsym
-                       opt-size fixed-size stored-size
+                       opt-size stored-size
                        lit-codes lit-lengths dist-codes dist-lengths
                        nbl hlit hdist hclen)
-  "Emit the cheapest of stored / fixed / dynamic for a large block."
+  "Emit stored or dynamic for a large block.  Fixed encoding is not worth
+its extra size-estimation pass once a block is large enough to reach here."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
-           (type fixnum start end nsym opt-size fixed-size stored-size
+           (type fixnum start end nsym opt-size stored-size
                    nbl hlit hdist hclen))
-  (cond ((<= stored-size (min opt-size fixed-size))
-         (emit-stored-blocks writer input start end))
-        ((<= fixed-size opt-size)
-         (emit-fixed-block writer (lzs-tokens scratch) nsym t))
-        (t (emit-dynamic-block writer (lzs-tokens scratch) nsym t
-                               lit-codes lit-lengths dist-codes dist-lengths
-                               (lzs-bl-sym scratch) (lzs-bl-extra scratch)
-                               (lzs-bl-codes scratch) (lzs-bl-lengths scratch)
-                               nbl hlit hdist hclen))))
+  (if (<= stored-size opt-size)
+      (emit-stored-blocks writer input start end)
+      (emit-dynamic-block writer (lzs-tokens scratch) nsym t
+                          lit-codes lit-lengths dist-codes dist-lengths
+                          (lzs-bl-sym scratch) (lzs-bl-extra scratch)
+                          (lzs-bl-codes scratch) (lzs-bl-lengths scratch)
+                          nbl hlit hdist hclen)))
 
 (defun %emit-optimized-block (writer input start end n nsym extra-bits scratch)
   "Full dynamic-tree planning plus cheapest-encoding emit for large inputs."
@@ -1076,15 +1068,12 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
             (%plan-bl-trees scratch lit-lengths hlit dist-lengths hdist)
           (declare (type fixnum nbl bl-extra hclen bl-code-bits))
           (ensure-static-trees)
-          (multiple-value-bind (dyn-bits fixed-bits)
-              (data-bits/dynamic-and-fixed
-               (lzs-tokens scratch) nsym
-               lit-lengths +static-lit-lengths+
-               dist-lengths +static-dist-lengths+ extra-bits)
-            (declare (type fixnum dyn-bits fixed-bits))
+          (let ((dyn-bits (data-bits (lzs-tokens scratch) nsym
+                                     lit-lengths dist-lengths extra-bits)))
+            (declare (type fixnum dyn-bits))
             (%emit-cheapest writer input start end scratch nsym
                             (+ 3 14 (* 3 hclen) bl-extra bl-code-bits dyn-bits)
-                            (+ 3 fixed-bits) (stored-block-bits writer n)
+                            (stored-block-bits writer n)
                             lit-codes lit-lengths dist-codes dist-lengths
                             nbl hlit hdist hclen)))))))
 

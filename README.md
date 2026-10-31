@@ -136,8 +136,8 @@ unavailable instructions.
 On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
 text/binary inputs), compression is now about 1.1-1.5x zlib at levels
 3/6/9 (level 9 reaches several times zlib on binary data).  Decompression
-is close to parity on text (~0.9x) and still around 0.8x on binary, so
-inflate remains the next target.
+is at parity on text and about 0.9x on binary; one-shot decompression is
+around 0.9-1.0x.  Binary inflate is the remaining small gap.
 
 ## Status
 

@@ -269,15 +269,17 @@ BASE | EXTRA<<16."
     (when (> kraft (ash 1 +max-code-length+))
       (error 'newzlib-format-error :detail "invalid Huffman code lengths"))))
 
-(defun %place-decode-symbols (lengths start n offsets symbols counts)
+(defun %place-decode-symbols (lengths start n offsets symbols counts
+                                &optional cursors)
   "Single-pass counting placement ordered by (length, index); seeds CURSORS
 from OFFSETS.  Returns the longest used code length."
   (declare (type (simple-array fixnum (*)) lengths)
            (type (simple-array (unsigned-byte 16) (*)) offsets symbols counts)
            (type fixnum start n)
            (optimize (speed 3) (safety 0)))
-  (let ((cursors (make-array (1+ +max-code-length+) :element-type 'fixnum
-                             :initial-element 0))
+  (let ((cursors (or cursors
+                     (make-array (1+ +max-code-length+) :element-type 'fixnum
+                                 :initial-element 0)))
         (top 0))
     (declare (type (simple-array fixnum (*)) cursors) (type fixnum top))
     (loop for l from 1 to +max-code-length+ do
@@ -292,7 +294,30 @@ from OFFSETS.  Returns the longest used code length."
           when (plusp (aref counts l)) do (setf top l) (return))
     top))
 
-(defun %fill-decode-fast (counts first offsets symbols root)
+(defconstant +decode-symbols-max+ 320)
+
+(defstruct (decode-scratch
+            (:constructor %make-decode-scratch)
+            (:conc-name ds-))
+  (counts nil :type (simple-array (unsigned-byte 16) (16)))
+  (first nil :type (simple-array (unsigned-byte 16) (16)))
+  (offsets nil :type (simple-array (unsigned-byte 16) (16)))
+  (symbols nil :type (simple-array (unsigned-byte 16) (*)))
+  (cursors nil :type (simple-array fixnum (16)))
+  (fast nil :type (simple-array (unsigned-byte 16) (*))))
+
+(defun make-decode-scratch ()
+  (%make-decode-scratch
+   :counts (make-array 16 :element-type '(unsigned-byte 16) :initial-element 0)
+   :first (make-array 16 :element-type '(unsigned-byte 16) :initial-element 0)
+   :offsets (make-array 16 :element-type '(unsigned-byte 16) :initial-element 0)
+   :symbols (make-array +decode-symbols-max+ :element-type '(unsigned-byte 16)
+                        :initial-element 0)
+   :cursors (make-array 16 :element-type 'fixnum :initial-element 0)
+   :fast (make-array (ash 1 +max-decode-root+)
+                     :element-type '(unsigned-byte 16) :initial-element 0)))
+
+(defun %fill-decode-fast (counts first offsets symbols root &optional fast)
   "Fill the 2^ROOT jump table keyed by LSB-first code; returns (VALUES
 FAST INDEX-ROOT), the table and the count of symbols it covers."
   (declare (type (simple-array (unsigned-byte 16) (*))
@@ -300,11 +325,13 @@ FAST INDEX-ROOT), the table and the count of symbols it covers."
            (type fixnum root)
            (optimize (speed 3) (safety 0)))
   (let* ((size (ash 1 root))
-         (fast (make-array size :element-type '(unsigned-byte 16)
-                           :initial-element 0))
+         (fast (or fast
+                   (make-array size :element-type '(unsigned-byte 16)
+                               :initial-element 0)))
          (index-root 0))
     (declare (type fixnum size index-root)
              (type (simple-array (unsigned-byte 16) (*)) fast))
+    (when fast (fill fast 0 :end size))
     (loop for l from 1 to root do (incf index-root (aref counts l)))
     ;; for each length L <= ROOT, fill indices whose low L bits equal the
     ;; bit-reversed code of every length-L symbol, keyed by the hold value
@@ -324,7 +351,7 @@ FAST INDEX-ROOT), the table and the count of symbols it covers."
     (values fast index-root)))
 
 (defun build-huffman-decode-table (lengths &optional (start 0) (n (length lengths))
-                                             (root 10))
+                                             (root 10) scratch)
   "Build a canonical Huffman decode table from the code lengths in
 LENGTHS[START,START+N).  ROOT bits look up at once through a fast jump
 table; longer codes fall back to a canonical walk.  NIL selects an
@@ -332,31 +359,42 @@ adaptive root capped at +MAX-DECODE-ROOT+."
   (declare (type (simple-array fixnum (*)) lengths)
            (type fixnum start n)
            (type (or null fixnum) root)
+           (type (or null decode-scratch) scratch)
            (optimize (speed 3) (safety 0)))
-  (let ((counts (make-array (1+ +max-code-length+)
-                            :element-type '(unsigned-byte 16)
-                            :initial-element 0))
-        (first (make-array (1+ +max-code-length+)
-                           :element-type '(unsigned-byte 16)
-                           :initial-element 0))
-        (offsets (make-array (1+ +max-code-length+)
-                             :element-type '(unsigned-byte 16)
-                             :initial-element 0))
-        (symbols (make-array n :element-type '(unsigned-byte 16)
-                             :initial-element 0)))
+  (let* ((counts (if scratch (ds-counts scratch)
+                     (make-array (1+ +max-code-length+)
+                                 :element-type '(unsigned-byte 16)
+                                 :initial-element 0)))
+         (first (if scratch (ds-first scratch)
+                    (make-array (1+ +max-code-length+)
+                                :element-type '(unsigned-byte 16)
+                                :initial-element 0)))
+         (offsets (if scratch (ds-offsets scratch)
+                      (make-array (1+ +max-code-length+)
+                                  :element-type '(unsigned-byte 16)
+                                  :initial-element 0)))
+         (symbols (if scratch (ds-symbols scratch)
+                      (make-array n :element-type '(unsigned-byte 16)
+                                  :initial-element 0))))
     (declare (type (simple-array (unsigned-byte 16) (*))
                    counts first offsets symbols))
+    (when scratch
+      (fill counts 0)
+      (fill first 0)
+      (fill offsets 0))
     (%count-code-lengths lengths start n counts)
     (%init-decode-bases counts first offsets)
     (let ((max-length (%place-decode-symbols lengths start n offsets
-                                              symbols counts)))
+                                              symbols counts
+                                              (and scratch (ds-cursors scratch)))))
       (declare (type fixnum max-length))
       (let ((decode-root (if root
                              (min (max 1 root) max-length)
                              (min +max-decode-root+ (max 1 max-length)))))
         (declare (type fixnum decode-root))
         (multiple-value-bind (fast index-root)
-            (%fill-decode-fast counts first offsets symbols decode-root)
+            (%fill-decode-fast counts first offsets symbols decode-root
+                               (and scratch (ds-fast scratch)))
           (make-hdt counts first offsets symbols max-length
                     decode-root fast index-root))))))
 

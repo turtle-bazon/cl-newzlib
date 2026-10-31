@@ -914,7 +914,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
                                  lengths 0 hlit nil
                                  (and scratch (is-lit-table-scratch scratch)))
                         (build-huffman-decode-table
-                         lengths hlit hdist 9
+                         lengths hlit hdist 12
                          (and scratch (is-dist-table-scratch scratch)))))))))))))
 
 ;;; ------------------------------------------------------------------

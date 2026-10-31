@@ -191,7 +191,7 @@ BASE | EXTRA<<16."
   ;; max-length   : longest code length in the table
   ;; root         : bits looked up at once in FAST (table size 2^ROOT)
   ;; fast         : 2^ROOT table; entry 0 = slow path (code longer than ROOT),
-  ;;                else (LENGTH << 9) | SYMBOL for a code of LENGTH <= ROOT
+  ;;                else (SYMBOL << 4) | LENGTH for a code of LENGTH <= ROOT
   ;; index-root   : number of symbols with code length <= ROOT
   (counts nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
   (first nil :read-only t :type (simple-array (unsigned-byte 16) (*)))
@@ -340,7 +340,7 @@ FAST INDEX-ROOT), the table and the count of symbols it covers."
       (loop for k from (aref offsets l) below (+ (aref offsets l)
                                                  (aref counts l)) do
         (let* ((sym (aref symbols k))
-               (entry (logior (ash l 9) sym))
+               (entry (logior (ash sym 4) l))
                (c (+ (aref first l) (- k (aref offsets l))))
                (idx (reverse-bits c l))
                (rep (ash 1 (the (integer 0 14) (- root l)))))
@@ -438,8 +438,8 @@ back to reading bits one at a time."
             (error 'newzlib-format-error :detail "invalid Huffman code")))
         ;; fast path
         (progn
-          (read-bits reader (ash entry -9))
-          (logand entry #x1FF)))))
+          (read-bits reader (logand entry #xF))
+          (ash entry -4)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Static tree tables (fixed blocks)

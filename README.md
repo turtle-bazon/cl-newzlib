@@ -151,17 +151,18 @@ SBCL 2.6.7 and 2.6.9), the streaming `into` API gives:
 
 | dataset | compress (into) | decompress (into) |
 |---------|----------------:|------------------:|
-| text | 1.08-1.13x | 0.90-0.95x |
-| binary | 1.32-1.37x | 0.77-0.84x |
-| zeroes | 2.97-3.05x | 1.61-1.79x |
-| random | 0.84-0.96x | 1.38-1.40x |
-| **geometric mean** | **1.37-1.46x** | **1.12-1.18x** |
+| text | 1.19-1.23x | 0.88-0.97x |
+| binary | 1.68-1.70x | 0.83-0.87x |
+| zeroes | 2.83-3.26x | 1.79-1.83x |
+| random | 1.00-1.25x | 1.30-1.33x |
+| **geometric mean** | **1.55-1.71x** | **1.15-1.19x** |
 
-Compression is at or above zlib at levels 6/9 (text 1.1-1.4x, binary
-1.3-3.3x) and about even at level 3; level 1 trails on both text and
-binary.  Decompression is at parity on text, 0.7-0.95x on binary, and
-faster on zeroes and random data.  One-shot decompression is 0.86-0.92x
-overall; binary inflate is the remaining gap.
+Compression is at or above zlib at every level except level 1 on binary
+data (0.93-0.97x).  Level 3 reaches 1.2-1.4x, levels 6/9 reach 1.3-1.7x,
+and binary level 9 is 3.9-4.1x.  Decompression is 0.88-0.97x on text and
+0.83-0.87x on binary; zeroes and random decompress faster than zlib.
+One-shot decompression is 0.88-0.90x overall; binary inflate is the
+remaining gap.
 
 ## Status
 

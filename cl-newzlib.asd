@@ -8,7 +8,8 @@ fast paths, aiming to compete with the C zlib implementation."
   :author "cl-newzlib contributors"
   :license "Zlib"
   :depends-on ("iterate"
-               "metabang-bind")
+               "metabang-bind"
+               #+sbcl "sb-cpu-features")
   :serial t
   :components ((:module "src"
                 :components ((:file "package")
@@ -18,6 +19,7 @@ fast paths, aiming to compete with the C zlib implementation."
                              (:file "simd-adler")
                              (:file "crc32")
                              (:file "pclmul-crc")
+                             (:file "cpu-init")
                              (:file "bit-io")
                              (:file "huffman")
                              (:file "simd")

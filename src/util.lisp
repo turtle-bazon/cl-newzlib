@@ -10,41 +10,28 @@
   (handler-case (require :sb-simd) (error () nil))
   (defun avx2-usable-p ()
     "True only when AVX2 is implemented and the OS has enabled YMM state.
-SBCL's runtime sets AVX2_SUPPORTED after CPUID plus XGETBV.  This is also
-consulted at compile time: compiling AVX2 code on an AVX2-less host is not
-safe, because SBCL may constant-fold sb-simd AVX2 constructors and execute
-them during compilation."
-    (ignore-errors
-      (plusp (sb-alien:extern-alien "avx2_supported" sb-alien:int))))
-  (let* ((pkg (find-package :sb-simd-internals))
-         (find-set (and pkg (find-symbol "FIND-INSTRUCTION-SET" pkg)))
-         (avail (and pkg (find-symbol "INSTRUCTION-SET-AVAILABLE-P" pkg)))
-         (cpuid (and pkg (find-symbol "CPUID" pkg))))
-    (flet ((supports-p (name)
-             (and find-set avail
-                  (ignore-errors
-                    (funcall avail (funcall find-set name))))))
-      ;; These features mean "the implementation is compiled into the image",
-      ;; not "this CPU can run it".  Runtime selection (AVX2-USABLE-P and the
-      ;; per-call dispatch) decides what is actually used.  Keeping AVX2 code
-      ;; compiled lets an image built on an AVX-only host enable it later on
-      ;; an AVX2 host.
-      (when (find-package :sb-simd)
-        (pushnew :newzlib-simd *features*))
-      (when (find-package :sb-simd-avx2)
-        (pushnew :newzlib-avx2 *features*)
-        ;; On a non-AVX2 build host, compile the AVX2 sources with every
-        ;; operation out of line so SBCL cannot constant-fold and execute
-        ;; AVX2 during compilation.
-        (when (avx2-usable-p)
-          (pushnew :newzlib-avx2-build *features*))))
-    ;; PCLMULQDQ is independent of AVX2; probe CPUID leaf 1 ECX bit 1.
-    ;; This code is runtime-gated, so compiling it is safe.
-    (when (and cpuid (fboundp cpuid)
-               (ignore-errors
-                 (and (>= (funcall cpuid 0) 1)
-                      (logbitp 1 (nth-value 2 (funcall cpuid 1))))))
-      (pushnew :newzlib-pclmul *features*))))
+SB-CPU-FEATURES derives this from SBCL's AVX2_SUPPORTED runtime flag, which
+is set after CPUID plus XGETBV.  This is also consulted at compile time:
+compiling AVX2 code on an AVX2-less host is not safe, because SBCL may
+constant-fold sb-simd AVX2 constructors and execute them during compilation."
+    (sb-cpu-features:cpu-feature-p :avx2))
+  ;; These features mean "the implementation is compiled into the image",
+  ;; not "this CPU can run it".  Runtime selection (AVX2-USABLE-P and the
+  ;; per-call dispatch) decides what is actually used.  Keeping AVX2 code
+  ;; compiled lets an image built on an AVX-only host enable it later on
+  ;; an AVX2 host.
+  (when (find-package :sb-simd)
+    (pushnew :newzlib-simd *features*))
+  (when (find-package :sb-simd-avx2)
+    (pushnew :newzlib-avx2 *features*)
+    ;; On a non-AVX2 build host, compile the AVX2 sources with every
+    ;; operation out of line so SBCL cannot constant-fold and execute
+    ;; AVX2 during compilation.
+    (when (avx2-usable-p)
+      (pushnew :newzlib-avx2-build *features*)))
+  ;; PCLMULQDQ is independent of AVX2.
+  (when (sb-cpu-features:cpu-feature-p :pclmulqdq)
+    (pushnew :newzlib-pclmul *features*)))
 
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))

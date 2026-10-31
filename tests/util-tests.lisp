@@ -5,6 +5,26 @@
 (test version-string
   (is (stringp (cl-newzlib:version))))
 
+#+sbcl
+(test cpu-feature-layer-wired-in
+  (is (find-package :sb-cpu-features))
+  (is (member 'cl-newzlib::refresh-cpu-dependent-implementations
+              sb-ext:*init-hooks*)))
+
+#+(and sbcl x86-64)
+(test avx2-usable-p-uses-sb-cpu-features
+  (is (eq (not (null (cl-newzlib::avx2-usable-p)))
+          (not (null (sb-cpu-features:cpu-feature-p :avx2)))))
+  (sb-cpu-features:with-cpu-features-only '()
+    (is (not (cl-newzlib::avx2-usable-p)))))
+
+#+sbcl
+(test cpu-init-hook-refreshes-features
+  (let ((sb-cpu-features::*detected-cpu-features* '(:bogus))
+        (sb-cpu-features::*cpu-features-probed-p* t))
+    (cl-newzlib::refresh-cpu-dependent-implementations)
+    (is (not (member :bogus (sb-cpu-features:cpu-features))))))
+
 (test level-constants
   (is (= 0 cl-newzlib:+no-compression+))
   (is (= 1 cl-newzlib:compression-level-fastest))

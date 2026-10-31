@@ -176,5 +176,4 @@ restarted on an AVX2 host), and clears the implementation when it does not."
                                  (error () nil)))))
             #'adler32-vector)))
 
-  (update-simd-adler-impl)
-  #+sbcl (pushnew 'update-simd-adler-impl sb-ext:*init-hooks*))
+  (update-simd-adler-impl))

@@ -166,13 +166,8 @@
   ;;; Availability probe + load-time self-test.
   ;;; ------------------------------------------------------------------
   (defun pclmul-cpu-available-p ()
-    "True when CPUID leaf 1 reports PCLMULQDQ in ECX (bit 1), queried from
-inside the implementation via sb-simd's CPUID wrapper -- no /proc or other
-OS channel involved, so this works wherever SBCL/x86-64 runs."
-    (handler-case
-        (and (>= (sb-simd-internals::cpuid 0) 1)
-             (logbitp 1 (nth-value 2 (sb-simd-internals::cpuid 1))))
-      (error () nil)))
+    "True when the CPU reports PCLMULQDQ and it is not masked out."
+    (sb-cpu-features:cpu-feature-p :pclmulqdq))
 
   (defun pclmul-self-test-p ()
     "Randomized differential check of the hardware path against the
@@ -223,5 +218,4 @@ does not."
                                  (error () nil)))))
             #'crc32-update/pclmul)))
 
-  (update-pclmul-crc-impl)
-  #+sbcl (pushnew 'update-pclmul-crc-impl sb-ext:*init-hooks*))
+  (update-pclmul-crc-impl))

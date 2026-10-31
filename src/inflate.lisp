@@ -704,7 +704,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
 
 (defun inflate-token-stream-bounded (reader buffer pos limit lit dist)
   "Decode a token stream into a caller-sized BUFFER without growth."
-  (declare (optimize (speed 3) (safety 0))
+  (declare (optimize (speed 3) (safety 0) (debug 0) (space 0))
            (type huffman-decode-table lit dist)
            (type (simple-array (unsigned-byte 8) (*)) buffer)
            (type fixnum pos limit))

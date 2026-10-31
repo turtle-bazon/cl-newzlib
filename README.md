@@ -151,18 +151,23 @@ SBCL 2.6.9), the streaming `into` API gives:
 
 | dataset | compress (into) | decompress (into) |
 |---------|----------------:|------------------:|
-| text | 1.26-1.32x | 0.94-0.97x |
-| binary | 1.69-1.74x | 0.86-0.90x |
-| zeroes | 3.10-3.62x | 1.72-1.82x |
-| random | 1.12-1.20x | 1.27-1.41x |
-| **geometric mean** | **1.68-1.74x** | **1.18-1.19x** |
+| text | 1.26-1.36x | 0.89-0.97x |
+| binary | 1.69-1.77x | 0.86-1.12x |
+| zeroes | 3.10-3.62x | 1.57-2.00x |
+| random | 1.12-1.22x | 1.27-1.41x |
+| **geometric mean** | **1.68-1.78x** | **1.12-1.29x** |
 
-Compression is at or above zlib at every level (text roughly 0.9-1.5x,
-binary 1.0-4.2x across levels 1/3/6/9).  Decompression is at parity on text
-and 0.86-0.90x on binary; zeroes and random decompress clearly faster than
-zlib.  One-shot compression is ~1.76x; one-shot decompression is ~0.90x
-overall (it must allocate a fresh result per call, which the harness's zlib
-side avoids).  Run-to-run variation on a shared host is about ±0.05x.
+Compression is at or above zlib at every level (text roughly 0.9-2.0x,
+binary 1.0-4.3x across levels 1/3/6/9).  Decompression is around parity on
+text and binary — an interleaved measurement gives roughly 0.95x / 0.97x
+(text levels 1/6) and 0.92x / 0.92x (binary levels 1/6) — while zeroes and
+random decompress clearly faster than zlib.  One-shot compression is
+~1.8x; one-shot decompression is ~0.9x overall (it must allocate a fresh
+result per call, which the harness's zlib side avoids).
+
+Decompression ratios are noisier than compression because the absolute
+times are small and the harness's zlib side shares the core; treat
+individual decompression cells as ±0.1x and the geomean as ±0.05x.
 
 ## Status
 

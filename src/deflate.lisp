@@ -801,20 +801,21 @@ code, then for matches the length extra, distance code and distance extra."
                              +static-lit-codes+ +static-lit-lengths+
                              +static-dist-codes+ +static-dist-lengths+)))))
 
-(defun data-bits (tokens nsym len-array dist-len-array extra-bits)
-  "Total coded bits for the token stream, plus the accumulated EXTRA-BITS."
+(defun data-bits (lit-freq dist-freq len-array dist-len-array extra-bits)
+  "Total coded bits for the token stream described by the symbol
+frequencies, plus the accumulated EXTRA-BITS.  Summing frequency times code
+length over the ~316 possible symbols is exact and avoids walking every
+token, which is a full extra pass over the stream."
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 32) (*)) tokens)
-           (type (simple-array fixnum (*)) len-array dist-len-array)
-           (type fixnum nsym extra-bits))
+           (type (simple-array fixnum (*)) lit-freq dist-freq
+                                          len-array dist-len-array)
+           (type fixnum extra-bits))
   (let ((bits extra-bits))
     (declare (type fixnum bits))
-    (loop for i below nsym do
-      (let ((token (aref tokens i)))
-        (let ((s (token-symbol token)))
-          (incf bits (aref len-array s))
-          (when (> s 256)
-            (incf bits (aref dist-len-array (token-distance-code token)))))))
+    (dotimes (s 286)
+      (incf bits (* (aref lit-freq s) (aref len-array s))))
+    (dotimes (d 30)
+      (incf bits (* (aref dist-freq d) (aref dist-len-array d))))
     bits))
 
 (declaim (inline %bl-run-limits %bl-push-verbatim %bl-push-repeat
@@ -1015,7 +1016,7 @@ rarely pay for themselves at that size)."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end n nsym extra-bits))
   (let ((stored-size (stored-block-bits writer n))
-        (fixed-size (+ 3 (data-bits (lzs-tokens scratch) nsym
+        (fixed-size (+ 3 (data-bits (lzs-lit-freq scratch) (lzs-dist-freq scratch)
                                     +static-lit-lengths+
                                     +static-dist-lengths+ extra-bits))))
     (declare (type fixnum stored-size fixed-size))
@@ -1096,7 +1097,7 @@ its extra size-estimation pass once a block is large enough to reach here."
             (%plan-bl-trees scratch lit-lengths hlit dist-lengths hdist)
           (declare (type fixnum nbl bl-extra hclen bl-code-bits))
           (ensure-static-trees)
-          (let ((dyn-bits (data-bits (lzs-tokens scratch) nsym
+          (let ((dyn-bits (data-bits (lzs-lit-freq scratch) (lzs-dist-freq scratch)
                                      lit-lengths dist-lengths extra-bits)))
             (declare (type fixnum dyn-bits))
             (%emit-cheapest writer input start end scratch nsym

@@ -151,18 +151,18 @@ SBCL 2.6.9), the streaming `into` API gives:
 
 | dataset | compress (into) | decompress (into) |
 |---------|----------------:|------------------:|
-| text | 1.23-1.29x | 0.91-0.95x |
-| binary | 1.74x | 0.88x |
-| zeroes | 3.31-3.34x | 1.66-1.72x |
-| random | 1.05-1.16x | 1.31-1.33x |
-| **geometric mean** | **1.65-1.72x** | **1.16x** |
+| text | 1.29-1.32x | 0.95-0.97x |
+| binary | 1.72-1.74x | 0.86-0.90x |
+| zeroes | 3.34-3.62x | 1.66-1.72x |
+| random | 1.12-1.16x | 1.31-1.41x |
+| **geometric mean** | **1.72-1.74x** | **1.16-1.19x** |
 
 Compression is at or above zlib at every level (text roughly 0.9-1.5x,
-binary 1.0-4.2x across levels 1/3/6/9).  Decompression is around 0.9-1.0x
-on text and 0.88x on binary; zeroes and random decompress faster than zlib.
-One-shot compression is ~1.75x; one-shot decompression is ~0.87x overall
-(it must allocate a fresh result per call, which the harness's zlib side
-avoids).  Run-to-run variation on a shared host is about ±0.05x.
+binary 1.0-4.2x across levels 1/3/6/9).  Decompression is at parity on text
+and 0.86-0.90x on binary; zeroes and random decompress clearly faster than
+zlib.  One-shot compression is ~1.76x; one-shot decompression is ~0.90x
+overall (it must allocate a fresh result per call, which the harness's zlib
+side avoids).  Run-to-run variation on a shared host is about ±0.05x.
 
 ## Status
 

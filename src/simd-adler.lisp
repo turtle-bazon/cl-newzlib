@@ -140,17 +140,19 @@ and unfolded initial sums."
                                    (ldb (byte 16 16) init)))
                 (return-from simd-adler-self-test-p nil))))))))
 
-  (defvar *simd-adler-self-test-passed*
-    (and (simd-adler-cpu-available-p)
-         (handler-case (simd-adler-self-test-p) (error () nil))))
+  (defvar *simd-adler-self-test-passed* nil
+    "True once the vector path has passed on a capable CPU.")
 
   (defun update-simd-adler-impl ()
-    "Select the Adler implementation for the current CPU.  Also called from
-SB-EXT:*INIT-HOOKS* so an image built on one machine falls back safely when
-restarted on another without AVX2."
+    "Select the Adler implementation for the current CPU.  Runs the self-test
+lazily when the CPU gains AVX2 (e.g. an image built on an AVX-only machine
+restarted on an AVX2 host), and clears the implementation when it does not."
     (setf *simd-adler-impl*
-          (when (and *simd-adler-self-test-passed*
-                     (simd-adler-cpu-available-p))
+          (when (and (simd-adler-cpu-available-p)
+                     (or *simd-adler-self-test-passed*
+                         (setf *simd-adler-self-test-passed*
+                               (handler-case (simd-adler-self-test-p)
+                                 (error () nil)))))
             #'adler32-vector)))
 
   (update-simd-adler-impl)

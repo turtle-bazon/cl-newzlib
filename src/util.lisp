@@ -8,28 +8,16 @@
 #+(and sbcl x86-64)
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (handler-case (require :sb-simd) (error () nil))
-  ;; Gate the SIMD sources on what the *running* CPU supports, not merely on
-  ;; which sb-simd packages happened to be compiled.  The package-prefixed
-  ;; symbols are looked up dynamically because util.lisp is read before the
-  ;; sb-simd contrib has necessarily been loaded.
-  (let* ((pkg (find-package :sb-simd-internals))
-         (find-set (and pkg (find-symbol "FIND-INSTRUCTION-SET" pkg)))
-         (avail (and pkg (find-symbol "INSTRUCTION-SET-AVAILABLE-P" pkg)))
-         (cpuid (and pkg (find-symbol "CPUID" pkg))))
-    (flet ((supports-p (name)
-             (and find-set avail
-                  (ignore-errors
-                    (funcall avail (funcall find-set name))))))
-      (when (supports-p :sse4.1)
-        (pushnew :newzlib-simd *features*)
-        (when (supports-p :avx2)
-          (pushnew :newzlib-avx2 *features*))))
-    ;; PCLMULQDQ is independent of AVX2; CPUID leaf 1 ECX bit 1.
-    (when (and cpuid (fboundp cpuid)
-               (ignore-errors
-                 (and (>= (funcall cpuid 0) 1)
-                      (logbitp 1 (nth-value 2 (funcall cpuid 1))))))
-      (pushnew :newzlib-pclmul *features*))))
+  ;; These features mean "this implementation was compiled into the image",
+  ;; not "this CPU supports it".  Every AVX2/PCLMUL entry point is selected
+  ;; again at runtime (and on image restart), so an image built on a machine
+  ;; without AVX2 can carry the code and enable it later on an AVX2 host.
+  (when (find-package :sb-simd)
+    (pushnew :newzlib-simd *features*))
+  (when (find-package :sb-simd-avx2)
+    (pushnew :newzlib-avx2 *features*))
+  (when (find-package :sb-simd-sse2)
+    (pushnew :newzlib-pclmul *features*)))
 
 (declaim (inline ubyte8-ref ubyte8-set))
 (declaim (inline octets-copy))

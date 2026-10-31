@@ -208,17 +208,19 @@ nonzero initial CRCs."
                            (crc32-update crc buf start end)))
                 (return-from pclmul-self-test-p nil))))))))
 
-  (defvar *pclmul-self-test-passed*
-    (and (pclmul-cpu-available-p)
-         (handler-case (pclmul-self-test-p) (error () nil))))
+  (defvar *pclmul-self-test-passed* nil
+    "True once the hardware path has passed on a capable CPU.")
 
   (defun update-pclmul-crc-impl ()
-    "Select the CRC implementation for the current CPU.  Also called from
-SB-EXT:*INIT-HOOKS* so an image built on one machine falls back safely when
-restarted on another without PCLMULQDQ."
+    "Select the CRC implementation for the current CPU.  Runs the self-test
+lazily when the CPU gains PCLMULQDQ, and clears the implementation when it
+does not."
     (setf *pclmul-crc-impl*
-          (when (and *pclmul-self-test-passed*
-                     (pclmul-cpu-available-p))
+          (when (and (pclmul-cpu-available-p)
+                     (or *pclmul-self-test-passed*
+                         (setf *pclmul-self-test-passed*
+                               (handler-case (pclmul-self-test-p)
+                                 (error () nil)))))
             #'crc32-update/pclmul)))
 
   (update-pclmul-crc-impl)

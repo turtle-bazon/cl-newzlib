@@ -151,11 +151,11 @@ SBCL 2.6.9), the streaming `into` API gives:
 
 | dataset | compress (into) | decompress (into) |
 |---------|----------------:|------------------:|
-| text | 1.29-1.32x | 0.95-0.97x |
-| binary | 1.72-1.74x | 0.86-0.90x |
-| zeroes | 3.34-3.62x | 1.66-1.72x |
-| random | 1.12-1.16x | 1.31-1.41x |
-| **geometric mean** | **1.72-1.74x** | **1.16-1.19x** |
+| text | 1.26-1.32x | 0.94-0.97x |
+| binary | 1.69-1.74x | 0.86-0.90x |
+| zeroes | 3.10-3.62x | 1.72-1.82x |
+| random | 1.12-1.20x | 1.27-1.41x |
+| **geometric mean** | **1.68-1.74x** | **1.18-1.19x** |
 
 Compression is at or above zlib at every level (text roughly 0.9-1.5x,
 binary 1.0-4.2x across levels 1/3/6/9).  Decompression is at parity on text

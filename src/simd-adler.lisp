@@ -40,6 +40,11 @@ below 2^31 throughout (signed view is safe), and s1/s2 stay below 2^32."
     (declare (type (unsigned-byte 32) s1 s2)
              (type (simple-array (unsigned-byte 8) (*)) octets)
              (type fixnum start end)
+             ;; SBCL can constant-fold a constructor call with all-constant
+             ;; arguments and execute it at compile time.  Keep this call
+             ;; out of line so an AVX2-less build host can still compile the
+             ;; module without executing AVX2.
+             (notinline sb-simd-avx2:make-s32.8)
              (optimize (speed 3) (safety 0) (debug 0)))
     ;; Zero-extended starts (lane 0 only): the SAD high halves stay zero,
     ;; so the final full horizontal sum counts the initial sums once.

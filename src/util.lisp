@@ -24,13 +24,15 @@ them during compilation."
              (and find-set avail
                   (ignore-errors
                     (funcall avail (funcall find-set name))))))
-      ;; SSE4.1 is compile-time gated too: no SIMD source is compiled on a
-      ;; CPU that cannot execute it.
-      (when (supports-p :sse4.1)
-        (pushnew :newzlib-simd *features*)
-        (when (and (find-package :sb-simd-avx2)
-                   (avx2-usable-p))
-          (pushnew :newzlib-avx2 *features*))))
+      ;; These features mean "the implementation is compiled into the image",
+      ;; not "this CPU can run it".  Runtime selection (AVX2-USABLE-P and the
+      ;; per-call dispatch) decides what is actually used.  Keeping AVX2 code
+      ;; compiled lets an image built on an AVX-only host enable it later on
+      ;; an AVX2 host.
+      (when (find-package :sb-simd)
+        (pushnew :newzlib-simd *features*))
+      (when (find-package :sb-simd-avx2)
+        (pushnew :newzlib-avx2 *features*)))
     ;; PCLMULQDQ is independent of AVX2; probe CPUID leaf 1 ECX bit 1.
     ;; This code is runtime-gated, so compiling it is safe.
     (when (and cpuid (fboundp cpuid)

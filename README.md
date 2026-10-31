@@ -128,15 +128,20 @@ Reported `cl/zlib` values are cl-newzlib's throughput divided by zlib's,
 so values above 1 mean cl-newzlib is faster.  `--mode fast` changes only
 cl-newzlib's matcher; zlib is always run with its default strategy.
 
-AVX2 and SSE4.1 source is compiled only when the build machine can execute
-it, because SBCL may constant-fold sb-simd AVX2 constructors during
-compilation.  PCLMULQDQ code is independent of AVX state and is compiled
-when sb-simd is available.  Every compiled AVX2/PCLMUL entry point is
-selected again at runtime: an image built on an AVX2 machine disables the
-AVX2 paths when restarted on a lesser CPU and re-enables them when moved
-back.  A build made on a non-AVX2 machine contains no AVX2 code, so it
-cannot gain it later without recompiling on an AVX2 machine.  The AVX2
-check includes OS YMM state (SBCL's XGETBV-backed flag), not just CPUID.
+AVX2, SSE4.1 and PCLMULQDQ code is compiled whenever the sb-simd packages
+are available, including on a build machine without those CPU features.
+Every entry point is selected at runtime: an image built on a non-AVX2
+machine can use its AVX2 code when moved to an AVX2 host, and an image
+built on AVX2 disables those paths when restarted on a lesser CPU.  The
+AVX2 check includes OS YMM state (SBCL's XGETBV-backed flag), not just
+CPUID.
+
+Compile-time constant folding is the one trap: SBCL may evaluate an
+sb-simd AVX2 constructor during compilation if all of its arguments are
+constants, which would execute AVX2 on an AVX2-less build host.  The
+compressor avoids this by sourcing the Adler zero vector from a runtime
+variable; any new AVX2 constructor with constant arguments must do the
+same.
 
 On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
 text/binary inputs), compression is now about 1.1-1.5x zlib at levels

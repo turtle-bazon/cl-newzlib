@@ -18,6 +18,10 @@
   (defvar *adler-w32* nil)   ; s8 weights [32..1], one 32-byte vector
   (defvar *adler-ones* nil)  ; s16 ones
   (defvar *adler-zeros* nil) ; u8 zeros (SAD baseline)
+  ;; A runtime zero source.  If MAKE-S32.8 were called with literal zeros,
+  ;; SBCL could constant-fold it while compiling and execute AVX2 on an
+  ;; AVX2-less host (the reported SB-SIMD-AVX2::S32.8 SIGILL).
+  (defvar *simd-zero* 0)
 
   ;; Weight tables are plain octet vectors, built once at load.
   (let ((w32 (make-array 32 :element-type '(signed-byte 8)))
@@ -41,7 +45,9 @@ below 2^31 throughout (signed view is safe), and s1/s2 stay below 2^32."
     ;; so the final full horizontal sum counts the initial sums once.
     (let ((vs1 (sb-simd-avx2:make-s32.8 s1 0 0 0 0 0 0 0))
           (vs2 (sb-simd-avx2:make-s32.8 s2 0 0 0 0 0 0 0))
-          (vsz (sb-simd-avx2:make-s32.8 0 0 0 0 0 0 0 0)))
+          (vsz (sb-simd-avx2:make-s32.8
+                *simd-zero* *simd-zero* *simd-zero* *simd-zero*
+                *simd-zero* *simd-zero* *simd-zero* *simd-zero*)))
       (declare (type sb-simd-avx2:s32.8 vs1 vs2 vsz))
       (let ((vs1-0 vs1)
             (vs3 vsz)

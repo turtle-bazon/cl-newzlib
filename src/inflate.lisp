@@ -484,6 +484,64 @@ live yet and will be overwritten)."
         ((<= length distance) (%copy-fresh-match buffer pos src length))
         (t (%copy-overlap-match buffer pos src distance length))))
 
+(declaim (inline %copy-inflate-match-unchecked))
+(defun %copy-inflate-match-unchecked (buffer pos src distance length osap)
+  "Like %COPY-INFLATE-MATCH, but the caller has already reserved
++INFLATE-HEADROOM+ bytes at POS, so the per-copy bounds checks are skipped.
+Used by the unchecked/growable loops, which guarantee room for any match
+(and for the up-to-64-byte wide store) before dispatching."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum pos src distance length)
+           #+sbcl (type (or null sb-sys:system-area-pointer) osap)
+           #-sbcl (ignore osap)
+           #-(and sbcl cl-newzlib-le) (ignore osap))
+  #+(and sbcl cl-newzlib-le)
+  (when osap
+    (cond
+      ((and (<= length 8) (<= length distance))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src))
+       (return-from %copy-inflate-match-unchecked (+ pos length)))
+      ((and (<= length 16) (<= length distance))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8)))
+       (return-from %copy-inflate-match-unchecked (+ pos length)))
+      ((and (<= length 32) (<= length distance))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8))
+             (sb-sys:sap-ref-64 osap (+ pos 16))
+             (sb-sys:sap-ref-64 osap (+ src 16))
+             (sb-sys:sap-ref-64 osap (+ pos 24))
+             (sb-sys:sap-ref-64 osap (+ src 24)))
+       (return-from %copy-inflate-match-unchecked (+ pos length)))
+      ((and (<= length 64) (<= length distance))
+       (setf (sb-sys:sap-ref-64 osap pos)
+             (sb-sys:sap-ref-64 osap src)
+             (sb-sys:sap-ref-64 osap (+ pos 8))
+             (sb-sys:sap-ref-64 osap (+ src 8))
+             (sb-sys:sap-ref-64 osap (+ pos 16))
+             (sb-sys:sap-ref-64 osap (+ src 16))
+             (sb-sys:sap-ref-64 osap (+ pos 24))
+             (sb-sys:sap-ref-64 osap (+ src 24))
+             (sb-sys:sap-ref-64 osap (+ pos 32))
+             (sb-sys:sap-ref-64 osap (+ src 32))
+             (sb-sys:sap-ref-64 osap (+ pos 40))
+             (sb-sys:sap-ref-64 osap (+ src 40))
+             (sb-sys:sap-ref-64 osap (+ pos 48))
+             (sb-sys:sap-ref-64 osap (+ src 48))
+             (sb-sys:sap-ref-64 osap (+ pos 56))
+             (sb-sys:sap-ref-64 osap (+ src 56)))
+       (return-from %copy-inflate-match-unchecked (+ pos length)))))
+  (cond ((<= length 16) (%copy-tiny-match buffer pos src length))
+        ((= distance 1) (%copy-run-match buffer pos length))
+        ((<= length distance) (%copy-fresh-match buffer pos src length))
+        (t (%copy-overlap-match buffer pos src distance length))))
+
 (defmacro %emit-inflate-match (s &optional bounded)
   "Decode length/distance extras for length code S and copy one match.
 Uses the loop locals BUFFER SIZE POS (rebinding all three) plus the
@@ -552,7 +610,8 @@ bit/table locals; S is evaluated three times (pass a variable)."
                         :detail "match distance exceeds output"))
                (let ((src (- pos distance)))
                  (declare (type fixnum src))
-                 (setf pos (%copy-inflate-match buffer pos src distance length osap limit))))))))))
+                 (setf pos (%copy-inflate-match-unchecked
+                            buffer pos src distance length osap))))))))))
 
 (defmacro %with-inflate-tables ((lit dist) &body body)
   "Bind the fast decode-table locals used by the token loop around BODY.

@@ -913,7 +913,8 @@ fields on every code."
         (buffer (bw-buffer writer))
         (size (bw-size writer)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits pos size)
+             (type (unsigned-byte 64) nbits)
+             (type fixnum pos size)
              (type (simple-array (unsigned-byte 8) (*)) buffer))
     (macrolet ((flush-word ()
                  `(progn

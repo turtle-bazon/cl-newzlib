@@ -635,40 +635,45 @@ handles only long codes (table entry 0), low bit counts and end-of-block."
           (return-from ,label (values buffer pos size)))
          (t (%emit-inflate-match-unchecked s))))))
 
-(defmacro %inflate-growable-paired-loop (label)
+(defmacro %inflate-growable-loop (label)
+  "Growable-output counterpart of %INFLATE-BOUNDED-UNCHECKED-LOOP.  SAFE-SIZE
+is recomputed after a grow; inside the literal/match inner loop POS is
+checked against it with one tagged-fixnum compare."
   `(loop do
-     (unless (<= (+ pos +inflate-headroom+) size)
+     (unless (<= pos safe-size)
        (multiple-value-bind (nbuffer nsize)
            (ensure-out-capacity buffer size pos +inflate-headroom+ limit)
-         (setf buffer nbuffer size nsize)))
-     (let ((s1 (%inflate-decode-one-full lit lroot lfast lmask)))
-       (declare (type fixnum s1))
+         (setf buffer nbuffer size nsize
+               safe-size (- nsize +inflate-headroom+))))
+     (loop while (and (>= nbits 15) (<= pos safe-size)) do
+       (let ((entry (aref lfast (logand accum lmask))))
+         (declare (type fixnum entry))
+         (when (zerop entry) (return))
+         (let ((s (logand entry #x1FF)))
+           (declare (type fixnum s))
+           (when (= s 256) (return))
+           (let ((clen (ash entry -9)))
+             (declare (type fixnum clen))
+             (setf accum (definitely-the (unsigned-byte 64)
+                           (ash accum (- clen)))
+                   nbits (- nbits clen))
+             (if (< s 256)
+                 (progn
+                   (setf (aref buffer pos) s)
+                   (incf pos))
+                 (%emit-inflate-match-unchecked s))))))
+     (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
+       (declare (type fixnum s))
        (cond
-         ((< s1 256)
-          (let ((s2 (%inflate-decode-one-full lit lroot lfast lmask)))
-            (declare (type fixnum s2))
-            (cond
-              ((< s2 256)
-               (setf (aref buffer pos) s1
-                     (aref buffer (1+ pos)) s2)
-               (incf pos 2))
-              ((= s2 256)
-               (setf (aref buffer pos) s1)
-               (incf pos)
-               (setf (br-accum reader) accum
-                     (br-nbits reader) nbits
-                     (br-pos reader) rpos)
-               (return-from ,label (values buffer pos size)))
-              (t
-               (setf (aref buffer pos) s1)
-               (incf pos)
-               (%emit-inflate-match-unchecked s2)))))
-         ((= s1 256)
+         ((< s 256)
+          (setf (aref buffer pos) s)
+          (incf pos))
+         ((= s 256)
           (setf (br-accum reader) accum
                 (br-nbits reader) nbits
                 (br-pos reader) rpos)
           (return-from ,label (values buffer pos size)))
-         (t (%emit-inflate-match-unchecked s1))))))
+         (t (%emit-inflate-match-unchecked s))))))
 
 (defun inflate-token-stream (reader buffer size pos lit dist &optional limit)
   "Decode literal/length-distance tokens into BUFFER[POS..] via LIT/DIST.
@@ -683,9 +688,10 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
         (rpos (br-pos reader)) (rend (br-end reader))
         (rbuf (br-buffer reader))
         (masks +low-bit-masks+)
-        (osap nil))
+        (osap nil)
+        (safe-size (- size +inflate-headroom+)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend)
+             (type fixnum nbits rpos rend safe-size)
              (type (simple-array (unsigned-byte 8) (*)) rbuf)
              (type (simple-array (unsigned-byte 64) (64)) masks)
              (type null osap))
@@ -694,7 +700,7 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
     (with-pinned-input (rsap rbuf)
       (%with-inflate-tables (lit dist)
         (block decode-done
-          (%inflate-growable-paired-loop decode-done))))))
+          (%inflate-growable-loop decode-done))))))
 
 (defun inflate-token-stream-bounded (reader buffer pos limit lit dist)
   "Decode a token stream into a caller-sized BUFFER without growth."

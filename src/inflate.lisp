@@ -750,7 +750,8 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
         (osap nil)
         (safe-size (- size +inflate-headroom+)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend safe-size)
+             (type (unsigned-byte 6) nbits)
+             (type fixnum rpos rend safe-size)
              (type (simple-array (unsigned-byte 8) (*)) rbuf)
              (type (simple-array (unsigned-byte 64) (64)) masks)
              (type null osap))
@@ -776,7 +777,8 @@ inflate_fast); it is written back on end-of-block, stale on error abort."
         ;; (+ POS HEADROOM) against LIMIT costs two tag conversions.
         (safe-limit (- limit +inflate-headroom+)))
     (declare (type (unsigned-byte 64) accum)
-             (type fixnum nbits rpos rend size safe-limit))
+             (type (unsigned-byte 6) nbits)
+             (type fixnum rpos rend size safe-limit))
     (with-pinned-input (rsap rbuf)
       #+sbcl
       (sb-sys:with-pinned-objects (buffer)

@@ -302,11 +302,11 @@ fast path (no symbol store/load roundtrip through memory)."
   `(progn
      (%inflate-fill ,root)
      (let ((entry (aref ,fast (logand accum ,mask))))
-       (declare (type (unsigned-byte 16) entry))
+       (declare (type (unsigned-byte 64) entry))
        (if (zerop entry)
            (%inflate-decode-slow ,table ,root ,mask)
            (let ((clen (logand entry #xF)))
-             (declare (type (unsigned-byte 4) clen))
+             (declare (type (unsigned-byte 64) clen))
              ;; Consume only after enough bits are known present: with a
              ;; truncated tail this signals end-of-input instead of
              ;; decoding garbage.
@@ -321,11 +321,11 @@ needs no second refill; the truncated-tail check replaces it."
   `(progn
      (%inflate-fill 15)
      (let ((entry (aref ,fast (logand accum ,mask))))
-       (declare (type (unsigned-byte 16) entry))
+       (declare (type (unsigned-byte 64) entry))
        (if (zerop entry)
            (%inflate-decode-slow ,table ,root ,mask)
            (let ((clen (logand entry #xF)))
-             (declare (type (unsigned-byte 4) clen))
+             (declare (type (unsigned-byte 64) clen))
              (when (< nbits clen)
                (error 'newzlib-end-of-input))
              (setf accum (definitely-the (unsigned-byte 64) (ash accum (- clen)))
@@ -651,7 +651,7 @@ are the per-table low-bit masks for the literal and distance roots."
 (defmacro %inflate-bounded-loop (while label)
   `(loop ,@(if while (list while) nil) do
      (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
-       (declare (type (unsigned-byte 9) s))
+       (declare (type (unsigned-byte 64) s))
        (cond
          ((< s 256)
           (when (> (1+ pos) limit)
@@ -680,13 +680,13 @@ handles only long codes (table entry 0), low bit counts and end-of-block."
      (unless ,while (return))
      (loop while (and (>= nbits 15) ,while) do
        (let ((entry (aref lfast (logand accum lmask))))
-         (declare (type (unsigned-byte 16) entry))
+         (declare (type (unsigned-byte 64) entry))
          (when (zerop entry) (return))
          (let ((s (ash entry -4)))
-           (declare (type (unsigned-byte 9) s))
+           (declare (type (unsigned-byte 64) s))
            (when (= s 256) (return))
            (let ((clen (logand entry #xF)))
-             (declare (type (unsigned-byte 4) clen))
+             (declare (type (unsigned-byte 64) clen))
              (setf accum (definitely-the (unsigned-byte 64)
                            (ash accum (- clen)))
                    nbits (- nbits clen))
@@ -697,7 +697,7 @@ handles only long codes (table entry 0), low bit counts and end-of-block."
                    (incf pos))
                  (%emit-inflate-match-unchecked s))))))
      (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
-       (declare (type (unsigned-byte 9) s))
+       (declare (type (unsigned-byte 64) s))
        (cond
          ((< s 256)
           #+sbcl (setf (sb-sys:sap-ref-8 osap pos) s)
@@ -722,13 +722,13 @@ checked against it with one tagged-fixnum compare."
                safe-size (- nsize +inflate-headroom+))))
      (loop while (and (>= nbits 15) (<= pos safe-size)) do
        (let ((entry (aref lfast (logand accum lmask))))
-         (declare (type (unsigned-byte 16) entry))
+         (declare (type (unsigned-byte 64) entry))
          (when (zerop entry) (return))
          (let ((s (ash entry -4)))
-           (declare (type (unsigned-byte 9) s))
+           (declare (type (unsigned-byte 64) s))
            (when (= s 256) (return))
            (let ((clen (logand entry #xF)))
-             (declare (type (unsigned-byte 4) clen))
+             (declare (type (unsigned-byte 64) clen))
              (setf accum (definitely-the (unsigned-byte 64)
                            (ash accum (- clen)))
                    nbits (- nbits clen))
@@ -738,7 +738,7 @@ checked against it with one tagged-fixnum compare."
                    (incf pos))
                  (%emit-inflate-match-unchecked s))))))
      (let ((s (%inflate-decode-one-full lit lroot lfast lmask)))
-       (declare (type (unsigned-byte 9) s))
+       (declare (type (unsigned-byte 64) s))
        (cond
          ((< s 256)
           (setf (aref buffer pos) s)

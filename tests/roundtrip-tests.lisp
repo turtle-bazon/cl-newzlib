@@ -212,6 +212,22 @@
       (decompress-octets (subseq c 0 (max 1 (floor (length c) 2)))
                          :format :raw))))
 
+(test truncation-at-every-byte-is-safe
+  ;; Cutting a stream anywhere must either fail with a NEWZLIB-ERROR or
+  ;; return a correct prefix of the original data.  In particular the
+  ;; inflate fast paths may not read past the buffer or emit garbage.
+  (let* ((data (text-data 500))
+         (raw (compress-octets data :format :raw :level 6)))
+    (is (equalp data (decompress-octets raw :format :raw)))
+    (signals cl-newzlib:newzlib-error
+      (decompress-octets (subseq raw 0 0) :format :raw))
+    (loop for n from 1 below (length raw) do
+      (handler-case
+          (let ((out (decompress-octets (subseq raw 0 n) :format :raw)))
+            (is (<= (length out) (length data)))
+            (is (equalp out (subseq data 0 (length out)))))
+        (cl-newzlib:newzlib-error () nil)))))
+
 (test zlib-header-invalid-rejected
   (let* ((data (small-data))
          (c (compress-octets data :format :zlib)))

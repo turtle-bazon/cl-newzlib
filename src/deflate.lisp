@@ -136,46 +136,31 @@ like zlib's INSERT_STRING match_head)."
             (aref head h) pos)
       old)))
 
-(declaim (inline insert-string-hash))
-(defun insert-string-hash (pos hash head prev)
+;;; HASH-3 through the pinned input SAP.  Two loads (a 16-bit pair plus the
+;;; third byte) instead of three tagged AREFs, and the same hash value.
+#+(and sbcl cl-newzlib-le)
+(declaim (inline insert-string-sap))
+#+(and sbcl cl-newzlib-le)
+(defun insert-string-sap (isap pos head prev)
   (declare (optimize (speed 3) (safety 0))
-           (type (simple-array (unsigned-byte 32) (*)) head prev)
-           (type fixnum pos hash))
-  (let ((old (aref head hash)))
+           (type sb-sys:system-area-pointer isap)
+           (type fixnum pos)
+           (type (simple-array (unsigned-byte 32) (*)) head prev))
+  (let* ((w (sb-sys:sap-ref-16 isap pos))
+         (b2 (sb-sys:sap-ref-8 isap (+ pos 2)))
+         (h (logand (logxor (logand w #xFF)
+                            (ash (logand w #xFF00) -3)
+                            (ash b2 10))
+                    +hash-mask+))
+         (old (aref head h)))
+    (declare (type (unsigned-byte 16) w)
+             (type fixnum b2 h))
     (setf (aref prev (logand pos +window-mask+)) old
-          (aref head hash) pos)
+          (aref head h) pos)
     old))
-
-(defmacro %ensure-hash-state ()
-  `(unless (= hash-pos pos)
-     (setf hash-a (aref input pos)
-           hash-b (aref input (1+ pos))
-           hash-c (aref input (+ pos 2))
-           hash-value (logand (logxor hash-a (ash hash-b 5) (ash hash-c 10))
-                             +hash-mask+)
-           hash-pos pos)))
-
-(defmacro %advance-hash-state ()
-  `(if (= hash-pos (1- pos))
-       (if (< (+ pos 2) end)
-           (progn
-             (setf hash-a hash-b
-                   hash-b hash-c
-                   hash-c (aref input (+ pos 2))
-                   hash-value (logand
-                               (logxor hash-a (ash hash-b 5) (ash hash-c 10))
-                               +hash-mask+)
-                   hash-pos pos))
-           (setf hash-pos -1))
-       (setf hash-pos -1)))
 
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (*)) fixnum) fixnum)
                  hash-3)
-         (ftype (function (fixnum fixnum
-                            (simple-array (unsigned-byte 32) (*))
-                            (simple-array (unsigned-byte 32) (*)))
-                          fixnum)
-                 insert-string-hash)
          (ftype (function (fixnum fixnum fixnum fixnum fixnum)
                           (values fixnum fixnum fixnum))
                  %lm-limits)
@@ -498,7 +483,6 @@ compression is fully deterministic across calls."
 
 (defmacro %lazy-drain-short ()
   `(progn
-     (setf hash-pos -1)
      (when have-pending
        (if (>= pending-len +min-match+)
            (progn
@@ -513,10 +497,11 @@ compression is fully deterministic across calls."
        (incf pos))))
 
 (defmacro %lazy-search-step ()
-  `(progn
-     (%ensure-hash-state)
-     (let ((cand (insert-string-hash pos hash-value head prev)))
-       (declare (type fixnum cand))
+  `(let ((cand #+(and sbcl cl-newzlib-le)
+               (insert-string-sap isap pos head prev)
+               #-(and sbcl cl-newzlib-le)
+               (insert-string input pos head prev)))
+     (declare (type fixnum cand))
        (let ((mlen 0) (mdist 0))
          (declare (type fixnum mlen mdist))
          (when (and (/= cand #xFFFFFFFF)
@@ -534,12 +519,10 @@ compression is fully deterministic across calls."
                 (%emit-match pending-len pending-dist)
                 (%insert-match-interior pending-pos pending-len (+ pending-pos 2))
                 (setf pos (+ pending-pos pending-len)
-                      have-pending nil
-                      hash-pos -1))
+                      have-pending nil))
                (have-pending
                 (%emit-literal (1- pos))
                 (incf pos)
-                (%advance-hash-state)
                 (setf pending-len mlen
                       pending-dist mdist
                       pending-pos (1- pos)))
@@ -547,8 +530,7 @@ compression is fully deterministic across calls."
                         pending-len mlen
                         pending-dist mdist
                         pending-pos pos)
-                  (incf pos)
-                  (%advance-hash-state)))))))
+                  (incf pos))))))
 
 (defun %lz77-search-lazy (input start end nice good max-chain max-lazy
                            tokens token-capacity head prev lit-freq dist-freq eq-fn)
@@ -562,10 +544,9 @@ adopt it only if no longer match starts on the next byte."
            (type fixnum start end nice good max-chain max-lazy token-capacity)
            (type function eq-fn))
   (let ((nsym 0) (extra-bits 0) (pos start)
-        (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0)
-        (hash-pos -1) (hash-value 0) (hash-a 0) (hash-b 0) (hash-c 0))
+        (have-pending nil) (pending-len 0) (pending-dist 0) (pending-pos 0))
     (declare (type fixnum nsym extra-bits pos pending-len pending-dist
-                        pending-pos hash-pos hash-value hash-a hash-b hash-c))
+                        pending-pos))
     (with-pinned-input (isap input)
       (loop while (< pos end) do
         (if (< (- end pos) +min-match+)
@@ -595,7 +576,10 @@ adopt it only if no longer match starts on the next byte."
             (progn
               (%emit-literal pos)
               (incf pos))
-            (let ((cand (insert-string input pos head prev)))
+            (let ((cand #+(and sbcl cl-newzlib-le)
+                        (insert-string-sap isap pos head prev)
+                        #-(and sbcl cl-newzlib-le)
+                        (insert-string input pos head prev)))
               (declare (type fixnum cand))
               (if (= cand #xFFFFFFFF)
                   (progn

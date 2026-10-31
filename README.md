@@ -146,11 +146,22 @@ stay enabled.  The Adler zero pack is also sourced from a runtime variable
 and its constructor is always `notinline`.  Any new AVX2 code should keep
 constant-foldable arguments out of AVX2 constructor calls.
 
-On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
-text/binary inputs), compression is now about 1.1-1.5x zlib at levels
-3/6/9 (level 9 reaches several times zlib on binary data).  Decompression
-is at parity on text and about 0.9x on binary; one-shot decompression is
-around 0.9-1.0x.  Binary inflate is the remaining small gap.
+On the development machine (Intel Xeon Skylake, zlib 1.2.13, 2 MiB inputs,
+SBCL 2.6.7 and 2.6.9), the streaming `into` API gives:
+
+| dataset | compress (into) | decompress (into) |
+|---------|----------------:|------------------:|
+| text | 1.08-1.13x | 0.90-0.95x |
+| binary | 1.32-1.37x | 0.77-0.84x |
+| zeroes | 2.97-3.05x | 1.61-1.79x |
+| random | 0.84-0.96x | 1.38-1.40x |
+| **geometric mean** | **1.37-1.46x** | **1.12-1.18x** |
+
+Compression is at or above zlib at levels 6/9 (text 1.1-1.4x, binary
+1.3-3.3x) and about even at level 3; level 1 trails on both text and
+binary.  Decompression is at parity on text, 0.7-0.95x on binary, and
+faster on zeroes and random data.  One-shot decompression is 0.86-0.92x
+overall; binary inflate is the remaining gap.
 
 ## Status
 

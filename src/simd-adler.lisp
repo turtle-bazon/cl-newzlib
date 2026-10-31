@@ -41,11 +41,25 @@ below 2^31 throughout (signed view is safe), and s1/s2 stay below 2^32."
              (type (simple-array (unsigned-byte 8) (*)) octets)
              (type fixnum start end)
              ;; SBCL can constant-fold a constructor call with all-constant
-             ;; arguments and execute it at compile time.  Keep this call
-             ;; out of line so an AVX2-less build host can still compile the
-             ;; module without executing AVX2.
+             ;; arguments and execute it at compile time.  The zero pack is
+             ;; sourced from a runtime variable below; keep this call out of
+             ;; line as a second line of defense.
              (notinline sb-simd-avx2:make-s32.8)
              (optimize (speed 3) (safety 0) (debug 0)))
+    ;; On a build host without AVX2, force all AVX2 operations out of line so
+    ;; compilation cannot execute any of them.  On an AVX2 build host the
+    ;; fast VOP versions stay available.
+    #-newzlib-avx2-build
+    (declare (notinline sb-simd-avx2:s32.8+
+                        sb-simd-avx2:s32.8-shiftl
+                        sb-simd-avx2:s32.8-values
+                        sb-simd-avx2:u8.32-sad
+                        sb-simd-avx2:s16.16-madd
+                        sb-simd-avx2:s16.16-maddubs
+                        sb-simd-avx:s32.8!
+                        sb-simd-avx:s8.32-aref
+                        sb-simd-avx:s16.16-aref
+                        sb-simd-avx:u8.32-aref))
     ;; Zero-extended starts (lane 0 only): the SAD high halves stay zero,
     ;; so the final full horizontal sum counts the initial sums once.
     (let ((vs1 (sb-simd-avx2:make-s32.8 s1 0 0 0 0 0 0 0))

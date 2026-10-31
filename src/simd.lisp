@@ -39,6 +39,10 @@
     (declare (optimize (speed 3) (safety 0))
              (type (simple-array (unsigned-byte 8) (*)) input)
              (type fixnum a b limit))
+    #-newzlib-avx2-build
+    (declare (notinline sb-simd-avx2:u8.32-movemask
+                        sb-simd-avx2:u8.32=
+                        sb-simd-avx:u8.32-aref))
     (let ((n 0))
       (declare (type fixnum n))
       (loop while (>= (- limit n) 32)

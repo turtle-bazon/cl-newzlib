@@ -136,12 +136,13 @@ built on AVX2 disables those paths when restarted on a lesser CPU.  The
 AVX2 check includes OS YMM state (SBCL's XGETBV-backed flag), not just
 CPUID.
 
-Compile-time constant folding is the one trap: SBCL may evaluate an
-sb-simd AVX2 constructor during compilation if all of its arguments are
-constants, which would execute AVX2 on an AVX2-less build host.  The
-compressor sources the Adler zero vector from a runtime variable and marks
-the constructor `notinline`; any new AVX2 constructor with constant
-arguments must do the same.
+Compile-time constant folding is the one trap: SBCL may evaluate AVX2
+operations during compilation if their arguments are constant.  On an
+AVX2-less build host the AVX2 kernels are therefore compiled with every
+AVX2 operation declared `notinline`; on an AVX2 build host the fast VOPs
+stay enabled.  The Adler zero pack is also sourced from a runtime variable
+and its constructor is always `notinline`.  Any new AVX2 code should keep
+constant-foldable arguments out of AVX2 constructor calls.
 
 On the development machine (SBCL 2.6.7 and 2.6.9, zlib 1.2.13, 2 MiB
 text/binary inputs), compression is now about 1.1-1.5x zlib at levels

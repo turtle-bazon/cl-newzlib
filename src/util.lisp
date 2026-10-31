@@ -32,7 +32,12 @@ them during compilation."
       (when (find-package :sb-simd)
         (pushnew :newzlib-simd *features*))
       (when (find-package :sb-simd-avx2)
-        (pushnew :newzlib-avx2 *features*)))
+        (pushnew :newzlib-avx2 *features*)
+        ;; On a non-AVX2 build host, compile the AVX2 sources with every
+        ;; operation out of line so SBCL cannot constant-fold and execute
+        ;; AVX2 during compilation.
+        (when (avx2-usable-p)
+          (pushnew :newzlib-avx2-build *features*))))
     ;; PCLMULQDQ is independent of AVX2; probe CPUID leaf 1 ECX bit 1.
     ;; This code is runtime-gated, so compiling it is safe.
     (when (and cpuid (fboundp cpuid)

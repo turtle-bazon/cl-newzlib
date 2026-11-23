@@ -36,7 +36,8 @@
    #:+no-compression+
    #:+default-compression+
    #:+best-compression+
-   ;; Streaming API
+   ;; Streaming API (whole-input conveniences; see the state API below for
+   ;; genuinely incremental, per-packet use)
    #:deflate-stream
    #:make-deflate-stream
    #:deflate-stream-write
@@ -47,5 +48,24 @@
    #:inflate-stream-read
    #:inflate-stream-eof-p
    #:inflate-stream-end
+   ;; Stateful streaming API
+   #:deflate-state
+   #:deflate-state-p
+   #:make-deflate-state
+   #:deflate-state-write
+   #:deflate-state-flush
+   #:deflate-state-finish
+   #:deflate-state-reset
+   #:deflate-state-end
+   #:deflate-packet
+   #:inflate-state
+   #:inflate-state-p
+   #:make-inflate-state
+   #:inflate-state-write
+   #:inflate-state-flush
+   #:inflate-state-finished-p
+   #:inflate-state-reset
+   #:inflate-state-end
+   #:inflate-packet
    ;; Version
    #:version))

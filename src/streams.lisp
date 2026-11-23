@@ -1,11 +1,14 @@
 (in-package #:cl-newzlib)
 
-;;; Streaming API.
+;;; One-shot streaming conveniences.
 ;;;
-;;; DEFLATE-STREAM accumulates input octets and produces the compressed
-;;; output in one pass on DEFLATE-STREAM-FINISH.  INFLATE-STREAM lazily
-;;; decompresses its whole input on the first read and serves it out in
-;;; chunks.
+;;; These are not incremental in the DEFLATE sense: DEFLATE-STREAM accumulates
+;;; all input and compresses it in one pass on DEFLATE-STREAM-FINISH, and
+;;; INFLATE-STREAM decompresses its whole input on the first read.  For
+;;; packet-by-packet use (for example SSH's stateful zlib compression, where
+;;; the window and bit position must survive across calls), use the
+;;; DEFLATE-STATE / INFLATE-STATE API in deflate-state.lisp and
+;;; inflate-state.lisp.
 
 (defstruct (deflate-stream
             (:constructor %make-deflate-stream)
@@ -20,9 +23,11 @@
 
 (defun make-deflate-stream (&key (level +default-compression+)
                                 (mode :standard))
-  "Create a compression stream at LEVEL.  MODE :FAST selects greedy
-  matching.  Feed it with DEFLATE-STREAM-WRITE, then produce the compressed
-  output with DEFLATE-STREAM-FINISH."
+  "Create a compression convenience stream at LEVEL.  MODE :FAST selects
+  greedy matching.  This buffers all input and compresses it once, on
+  DEFLATE-STREAM-FINISH; it is not an incremental DEFLATE stream -- use
+  MAKE-DEFLATE-STATE for that.  Feed it with DEFLATE-STREAM-WRITE, then
+  produce the compressed output with DEFLATE-STREAM-FINISH."
   (check-compression-level level)
   (check-compression-mode mode)
   (%make-deflate-stream :buffer (make-growable-buffer 1024)
@@ -70,7 +75,9 @@
   (ready nil :type boolean))              ; whether DECODED has been filled
 
 (defun make-inflate-stream (octets &optional (start 0) (end (length octets)))
-  "Create a decompression stream over the compressed octets OCTETS[START,END)."
+  "Create a decompression convenience stream over the compressed octets
+  OCTETS[START,END).  The whole input is decompressed on the first read; use
+  MAKE-INFLATE-STATE for incremental packet-by-packet decompression."
   (declare (type simple-array octets)
            (type fixnum start end))
   (%make-inflate-stream :input (subseq octets start end)))

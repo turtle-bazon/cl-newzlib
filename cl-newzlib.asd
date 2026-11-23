@@ -28,4 +28,6 @@ fast paths, aiming to compete with the C zlib implementation."
                              (:file "zlib-format")
                              (:file "gzip-format")
                              (:file "streams")
-                             (:file "api")))))
+                             (:file "api")
+                             (:file "deflate-state")
+                             (:file "inflate-state")))))

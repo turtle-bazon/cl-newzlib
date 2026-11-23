@@ -71,10 +71,62 @@ in which case `buffer` is left partially written.
 
 ## Streaming API
 
+Two layers are available.  The `*-stream` functions are one-shot
+conveniences: `deflate-stream` buffers all input and compresses it in one pass
+on finish, and `inflate-stream` decompresses its whole input on the first
+read.
+
 ```lisp
 cl-newzlib:make-deflate-stream ; / deflate-stream-write / deflate-stream-finish / deflate-stream-end
 cl-newzlib:make-inflate-stream ; / inflate-stream-read / inflate-stream-eof-p / inflate-stream-end
 ```
+
+The `*-state` functions are genuinely incremental: the LZ77 window, hash
+chains, Huffman state, bit position and checksum survive across calls, so one
+object per direction can compress or decompress a whole session packet by
+packet.  This is the API SSH needs (RFC 4253 section 6.2): after each packet,
+`deflate-state-flush` completes the current block and returns the pending
+output without ending the stream.
+
+```lisp
+;; Compression, one persistent state per direction.
+(cl-newzlib:make-deflate-state :format :zlib :level 1 :strategy :huffman-only)
+(cl-newzlib:deflate-state-write state octets :start 0 :end nil) ; => octets
+(cl-newzlib:deflate-state-flush state :mode :partial)           ; or :sync
+(cl-newzlib:deflate-state-finish state)      ; BFINAL plus wrapper trailer
+(cl-newzlib:deflate-state-reset state)       ; new header octets for NEWKEYS
+(cl-newzlib:deflate-state-end state)
+
+;; Decompression.
+(cl-newzlib:make-inflate-state :format :zlib)
+(cl-newzlib:inflate-state-write state octets :start 0 :end nil) ; => plaintext
+(cl-newzlib:inflate-state-flush state)
+(cl-newzlib:inflate-state-finished-p state)
+(cl-newzlib:inflate-state-reset state)
+(cl-newzlib:inflate-state-end state)
+
+;; Optional packet conveniences (write + flush, write + drain).
+(cl-newzlib:deflate-packet state octets :start 0 :end nil)
+(cl-newzlib:inflate-packet state octets :start 0 :end nil)
+```
+
+`deflate-state-flush :mode :partial` emits an empty fixed block (zlib's
+`Z_PARTIAL_FLUSH`, 10 bits) and `:sync` emits an empty stored block
+(`Z_SYNC_FLUSH`, byte-aligned `00 00 FF FF`); a peer using `Z_SYNC_FLUSH`
+accepts both.  `finish` writes `BFINAL=1` and the Adler-32 (zlib) or CRC-32 /
+ISIZE (gzip) trailer; `:raw` has neither header nor trailer.  Writing after
+`finish` signals `newzlib-parameter-error`.
+
+Compression strategies are `:default`, `:huffman-only` (`Z_HUFFMAN_ONLY`,
+matching OpenSSH 10.6's outgoing compressor), `:fixed` (`Z_FIXED`) and `:rle`
+(`Z_RLE`).  `:window-bits` and `:mem-level` are accepted for zlib API
+compatibility; compression always uses the full 32 KiB DEFLATE window.
+
+A state is not thread-safe and must not be shared between directions.  Its
+memory use is O(window plus pending output), independent of the stream
+length.  Incremental decompression never treats a short input as an error:
+an incomplete block is retained until the next `inflate-state-write`, while
+corrupt data or a bad trailer signals `newzlib-format-error`.
 
 ## Checksums
 

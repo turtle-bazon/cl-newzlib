@@ -12,4 +12,5 @@
                              (:file "bit-io-tests")
                              (:file "huffman-tests")
                              (:file "roundtrip-tests")
-                             (:file "cross-tests")))))
+                             (:file "cross-tests")
+                             (:file "state-tests")))))

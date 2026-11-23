@@ -616,6 +616,49 @@ possibly-grown token vector and its capacity."
       (%lz77-search-greedy input start end nice good max-chain max-lazy
                            tokens token-capacity head prev lit-freq dist-freq eq-fn)))
 
+(defun %lz77-literals (input start end tokens token-capacity lit-freq dist-freq)
+  "Tokenize INPUT[START,END) as literals only (zlib's Z_HUFFMAN_ONLY)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
+           (type (simple-array fixnum (*)) lit-freq dist-freq)
+           (type fixnum start end token-capacity))
+  (declare (ignore dist-freq))
+  (let ((nsym 0) (extra-bits 0))
+    (declare (type fixnum nsym extra-bits))
+    (loop for p fixnum from start below end do
+      (%emit-literal p))
+    (values nsym extra-bits tokens token-capacity)))
+
+(defun %lz77-rle (input start end tokens token-capacity lit-freq dist-freq)
+  "Tokenize INPUT[START,END) with distance-1 runs only (zlib's Z_RLE)."
+  (declare (optimize (speed 3) (safety 0))
+           (type (simple-array (unsigned-byte 8) (*)) input)
+           (type (simple-array (unsigned-byte 32) (*)) tokens)
+           (type (simple-array fixnum (*)) lit-freq dist-freq)
+           (type fixnum start end token-capacity))
+  (let ((nsym 0) (extra-bits 0) (pos start))
+    (declare (type fixnum nsym extra-bits pos))
+    (loop while (< pos end) do
+      (let* ((b (aref input pos))
+             (run 1))
+        (declare (type fixnum b run))
+        ;; A distance-1 match copies the previous byte, so it can only be
+        ;; used when POS has history and the run extends that same byte.
+        (when (and (plusp pos) (= b (aref input (1- pos))))
+          (loop while (and (< (+ pos run) end)
+                           (< run +max-match+)
+                           (= (aref input (+ pos run)) b))
+                do (incf run)))
+        (if (and (plusp pos) (>= run +min-match+))
+            (progn
+              (%emit-match run 1)
+              (incf pos run))
+            (progn
+              (%emit-literal pos)
+              (incf pos)))))
+    (values nsym extra-bits tokens token-capacity)))
+
 (defun run-lz77 (input start end level tokens token-capacity
                  lit-freq dist-freq
                  &optional (head (make-array +hash-size+
@@ -624,9 +667,13 @@ possibly-grown token vector and its capacity."
                            (prev (make-array +window-size+
                                              :element-type '(unsigned-byte 32)
                                              :initial-element #xFFFFFFFF))
-                           (mode :standard))
+                           (mode :standard)
+                           (strategy :default))
   "Run LZ77 over INPUT[START,END), filling the packed token buffer and the
-symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
+symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY.
+STRATEGY is :DEFAULT, :HUFFMAN-ONLY (limiting to literal symbols) or :RLE
+(distance-1 runs only); :FIXED only affects block coding, see
+DEFLATE-BLOCK-INTO-WRITER."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type (simple-array (unsigned-byte 32) (*)) tokens)
@@ -643,18 +690,26 @@ symbol frequency vectors.  Returns NSYM, EXTRA-BITS, TOKENS, and CAPACITY."
          (lazy (if (and large (= level 9)) 32 (lazy-length level)))
          (eq-fn (select-leading-equal-octets)))
     (multiple-value-bind (nsym extra-bits tokens token-capacity)
-        (%lz77-search input start end
-                      (if fast-p (min 32 nice) nice)
-                      (if fast-p
-                          (min 3 (good-length level (- end start)))
-                          (good-length level (- end start)))
-                      (if fast-p
-                          (min 24 (chain-limit level (- end start)))
-                          (chain-limit level (- end start)))
-                      lazy
-                      (and (not fast-p) (> level 3))
-                      tokens token-capacity head prev lit-freq dist-freq
-                      eq-fn)
+        (case strategy
+          (:huffman-only
+           (%lz77-literals input start end tokens token-capacity
+                           lit-freq dist-freq))
+          (:rle
+           (%lz77-rle input start end tokens token-capacity
+                      lit-freq dist-freq))
+          (otherwise
+           (%lz77-search input start end
+                         (if fast-p (min 32 nice) nice)
+                         (if fast-p
+                             (min 3 (good-length level (- end start)))
+                             (good-length level (- end start)))
+                         (if fast-p
+                             (min 24 (chain-limit level (- end start)))
+                             (chain-limit level (- end start)))
+                         lazy
+                         (and (not fast-p) (> level 3))
+                         tokens token-capacity head prev lit-freq dist-freq
+                         eq-fn)))
       (multiple-value-bind (final-nsym tokens token-capacity)
           (finish-token-stream tokens token-capacity lit-freq nsym)
         (values final-nsym extra-bits tokens token-capacity)))))
@@ -703,17 +758,17 @@ alignment.  Blocks after the first start at a byte boundary."
                     (* (+ 3 5 32) (1- (ceiling n +max-stored-block+)))))
              8)))
 
-(defun emit-stored-blocks (writer input start end)
+(defun emit-stored-blocks (writer input start end &optional (bfinal t))
   "Emit INPUT[START,END) as stored blocks, splitting at +MAX-STORED-BLOCK+
-bytes per block."
+bytes per block.  BFINAL is set on the last block only when non-NIL."
   (declare (optimize (speed 3) (safety 0))
            (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end))
   (if (< start end)
       (loop for s from start below end by +max-stored-block+
             do (let ((e (min end (+ s +max-stored-block+))))
-                 (emit-stored-block writer input s e (>= e end))))
-      (emit-stored-block writer input start end t)))
+                 (emit-stored-block writer input s e (and bfinal (>= e end)))))
+      (emit-stored-block writer input start end bfinal)))
 
 (defun emit-stored-block (writer input start end bfinal)
   (declare (optimize (speed 3) (safety 0))
@@ -918,7 +973,10 @@ fields on every code."
              (type (simple-array (unsigned-byte 8) (*)) buffer))
     (macrolet ((flush-word ()
                  `(progn
-                    (when (>= pos size)
+                    ;; Grow before the 4-octet store: POS may be within the
+                    ;; last three bytes of the buffer, which a word write
+                    ;; would overrun.
+                    (when (> (+ pos 4) size)
                       (setq buffer (grow-buffer buffer size)
                             size (* 2 size)))
                     #+(and sbcl cl-newzlib-le)
@@ -996,7 +1054,8 @@ fields on every code."
         (bw-nbits writer) 0)
   writer)
 
-(defun %emit-tiny-choice (writer input start end n nsym extra-bits scratch)
+(defun %emit-tiny-choice (writer input start end n nsym extra-bits scratch
+                          &optional (bfinal t))
   "Stored-vs-fixed choice for inputs of at most 1024 bytes (dynamic trees
 rarely pay for themselves at that size)."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
@@ -1008,8 +1067,23 @@ rarely pay for themselves at that size)."
     (declare (type fixnum stored-size fixed-size))
     (ensure-static-trees)
     (if (<= stored-size fixed-size)
-        (emit-stored-blocks writer input start end)
-        (emit-fixed-block writer (lzs-tokens scratch) nsym t))))
+        (emit-stored-blocks writer input start end bfinal)
+        (emit-fixed-block writer (lzs-tokens scratch) nsym bfinal))))
+
+(defun %emit-fixed-or-stored (writer input start end n nsym extra-bits scratch
+                              bfinal)
+  "Stored-vs-fixed choice with dynamic trees disabled (zlib Z_FIXED)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type fixnum start end n nsym extra-bits))
+  (let ((stored-size (stored-block-bits writer n))
+        (fixed-size (+ 3 (data-bits (lzs-lit-freq scratch) (lzs-dist-freq scratch)
+                                    +static-lit-lengths+
+                                    +static-dist-lengths+ extra-bits))))
+    (declare (type fixnum stored-size fixed-size))
+    (ensure-static-trees)
+    (if (<= stored-size fixed-size)
+        (emit-stored-blocks writer input start end bfinal)
+        (emit-fixed-block writer (lzs-tokens scratch) nsym bfinal))))
 
 (defun %span-of-used (lengths hi lo floor)
   "One plus the highest used index in LENGTHS[LO..HI], at least FLOOR."
@@ -1048,21 +1122,22 @@ NBL BL-EXTRA HCLEN BL-CODE-BITS)."
 (defun %emit-cheapest (writer input start end scratch nsym
                        opt-size stored-size
                        lit-codes lit-lengths dist-codes dist-lengths
-                       nbl hlit hdist hclen)
+                       nbl hlit hdist hclen &optional (bfinal t))
   "Emit stored or dynamic for a large block.  Fixed encoding is not worth
 its extra size-estimation pass once a block is large enough to reach here."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end nsym opt-size stored-size
                    nbl hlit hdist hclen))
   (if (<= stored-size opt-size)
-      (emit-stored-blocks writer input start end)
-      (emit-dynamic-block writer (lzs-tokens scratch) nsym t
+      (emit-stored-blocks writer input start end bfinal)
+      (emit-dynamic-block writer (lzs-tokens scratch) nsym bfinal
                           lit-codes lit-lengths dist-codes dist-lengths
                           (lzs-bl-sym scratch) (lzs-bl-extra scratch)
                           (lzs-bl-codes scratch) (lzs-bl-lengths scratch)
                           nbl hlit hdist hclen)))
 
-(defun %emit-optimized-block (writer input start end n nsym extra-bits scratch)
+(defun %emit-optimized-block (writer input start end n nsym extra-bits scratch
+                              &optional (bfinal t))
   "Full dynamic-tree planning plus cheapest-encoding emit for large inputs."
   (declare (type (simple-array (unsigned-byte 8) (*)) input)
            (type fixnum start end n nsym extra-bits))
@@ -1090,7 +1165,45 @@ its extra size-estimation pass once a block is large enough to reach here."
                             (+ 3 14 (* 3 hclen) bl-extra bl-code-bits dyn-bits)
                             (stored-block-bits writer n)
                             lit-codes lit-lengths dist-codes dist-lengths
-                            nbl hlit hdist hclen)))))))
+                            nbl hlit hdist hclen bfinal)))))))
+
+(defun deflate-block-into-writer (input start end writer level scratch mode
+                                  strategy bfinal)
+  "Compress INPUT[START,END) as one DEFLATE block (or one stored block) into
+WRITER.  STRATEGY is :DEFAULT, :HUFFMAN-ONLY, :FIXED or :RLE.  BFINAL marks
+the block as the end of the stream.  SCRATCH must be supplied; its hash
+tables are left intact so callers can continue a stream across blocks."
+  (declare (type (simple-array (unsigned-byte 8) (*)) input)
+           (type bit-writer writer)
+           (type fixnum start end level)
+           (type lz77-scratch scratch))
+  (check-compression-mode mode)
+  (let ((n (- end start)))
+    (declare (type fixnum n))
+    (if (zerop level)
+        (emit-stored-blocks writer input start end bfinal)
+        (progn
+          (fill (lzs-lit-freq scratch) 0)
+          (fill (lzs-dist-freq scratch) 0)
+          (fill (lzs-bl-freq scratch) 0)
+          (multiple-value-bind (nsym extra-bits tokens token-capacity)
+              (run-lz77 input start end level
+                        (lzs-tokens scratch) (lzs-token-capacity scratch)
+                        (lzs-lit-freq scratch) (lzs-dist-freq scratch)
+                        (lzs-head scratch) (lzs-prev scratch) mode strategy)
+            (declare (type fixnum nsym extra-bits token-capacity))
+            (setf (lzs-tokens scratch) tokens
+                  (lzs-token-capacity scratch) token-capacity)
+            (cond
+              ((eq strategy :fixed)
+               (%emit-fixed-or-stored writer input start end
+                                      n nsym extra-bits scratch bfinal))
+              ((<= n 1024)
+               (%emit-tiny-choice writer input start end
+                                  n nsym extra-bits scratch bfinal))
+              (t
+               (%emit-optimized-block writer input start end
+                                      n nsym extra-bits scratch bfinal))))))))
 
 (defun deflate-into-writer (input start end writer level &optional scratch (mode :standard))
   "Compress INPUT[START,END) into WRITER as one DEFLATE stream.  Level 0
@@ -1108,23 +1221,8 @@ emits stored blocks; higher levels pick the cheapest block encoding."
           (unless scratch
             (setf scratch (acquire-lz77-scratch (1+ n))))
           (unwind-protect
-               (progn
-                 (fill (lzs-lit-freq scratch) 0)
-                 (fill (lzs-dist-freq scratch) 0)
-                 (fill (lzs-bl-freq scratch) 0)
-                 (multiple-value-bind (nsym extra-bits tokens token-capacity)
-                     (run-lz77 input start end level
-                               (lzs-tokens scratch) (lzs-token-capacity scratch)
-                               (lzs-lit-freq scratch) (lzs-dist-freq scratch)
-                               (lzs-head scratch) (lzs-prev scratch) mode)
-                   (declare (type fixnum nsym extra-bits token-capacity))
-                   (setf (lzs-tokens scratch) tokens
-                         (lzs-token-capacity scratch) token-capacity)
-                   (if (<= n 1024)
-                       (%emit-tiny-choice writer input start end
-                                          n nsym extra-bits scratch)
-                       (%emit-optimized-block writer input start end
-                                              n nsym extra-bits scratch))))
+               (deflate-block-into-writer input start end writer level
+                                          scratch mode :default t)
             (when owned
               (release-lz77-scratch scratch)))))))
 

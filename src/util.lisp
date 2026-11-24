@@ -29,8 +29,16 @@ constant-fold sb-simd AVX2 constructors and execute them during compilation."
     ;; AVX2 during compilation.
     (when (avx2-usable-p)
       (pushnew :newzlib-avx2-build *features*)))
-  ;; PCLMULQDQ is independent of AVX2.
-  (when (sb-cpu-features:cpu-feature-p :pclmulqdq)
+  ;; PCLMULQDQ is independent of AVX2, but the implementation in
+  ;; src/pclmul-crc.lisp is written against SB-SIMD-SSE2 (house VOPs for the
+  ;; carry-less multiply, SB-SIMD lane types for everything else), so this
+  ;; feature has to depend on that package existing as well as on the CPU
+  ;; flag.  A CPU flag alone is not enough: SBCL 2.6.9 on FreeBSD 15.1
+  ;; reports PCLMULQDQ but ships no sb-simd contrib, and the reader then
+  ;; died on "Package SB-SIMD-SSE2 does not exist" while compiling this
+  ;; system -- which takes every dependent system down with it.
+  (when (and (find-package :sb-simd-sse2)
+             (sb-cpu-features:cpu-feature-p :pclmulqdq))
     (pushnew :newzlib-pclmul *features*)))
 
 (declaim (inline ubyte8-ref ubyte8-set))
